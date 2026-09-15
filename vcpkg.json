@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "pyxis",
+  "version": "0.1.0",
+  "description": "Reproductor de video de alto rendimiento para Windows 11 x64",
+  "homepage": "https://github.com/D0PZ/pyxis",
+  "license": "GPL-3.0-or-later",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avformat",
+        "swresample",
+        "swscale",
+        "dav1d"
+      ]
+    }
+  ]
+}

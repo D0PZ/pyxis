@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+
+  <assemblyIdentity type="win32" name="Pyxis.MediaPlayer" version="0.1.0.0"
+                    processorArchitecture="amd64"/>
+
+  <description>Reproductor de video de alto rendimiento para Windows 11 x64</description>
+
+  <!-- Sin elevacion: un reproductor de video no tiene ningun motivo para pedir
+       privilegios de administrador. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!-- Declarar compatibilidad con Windows 10/11 desactiva las capas de
+       compatibilidad heredadas. Sin esto, GetVersionEx miente y algunas APIs
+       se comportan como en Windows 8. -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- PerMonitorV2: la ventana se entera de los cambios de PPP al moverse
+           entre monitores de distinta densidad y no la reescala el sistema.
+           Tambien se fija por codigo en main.cpp; tenerlo en el manifiesto hace
+           que aplique antes incluso de que arranque la CRT. -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+
+      <!-- Paginas de codigo estrechas en UTF-8: las rutas con acentos o
+           caracteres CJK pasan intactas por las APIs ANSI de FFmpeg. -->
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+
+      <!-- Rutas de mas de 260 caracteres, habituales en bibliotecas de series
+           con nombres largos. -->
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+
+  <!-- Controles comunes v6: el dialogo de archivo usa el estilo visual actual
+       en lugar del aspecto de Windows 95. -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+                        version="6.0.0.0" processorArchitecture="amd64"
+                        publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+</assembly>

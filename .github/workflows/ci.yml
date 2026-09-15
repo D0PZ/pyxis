@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Una compilacion en curso por rama: los empujones seguidos cancelan el anterior
+# en lugar de hacer cola. Compilar FFmpeg no es barato.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_DISABLE_METRICS: 1
+
+jobs:
+  build:
+    name: Compilar (${{ matrix.configuration }})
+    runs-on: windows-2025
+
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [release, debug]
+
+    steps:
+      - name: Obtener el codigo
+        uses: actions/checkout@v4
+
+      - name: Preparar MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Instalar Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Preparar vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          # La cache binaria de vcpkg convierte los 30 minutos de FFmpeg en
+          # segundos a partir de la segunda ejecucion.
+          runVcpkgInstall: false
+
+      - name: Configurar
+        run: cmake --preset ${{ matrix.configuration }}
+        env:
+          VCPKG_ROOT: ${{ env.VCPKG_ROOT }}
+
+      - name: Compilar
+        run: cmake --build --preset ${{ matrix.configuration }}
+
+      - name: Comprobar que el binario es autocontenido
+        shell: pwsh
+        run: |
+          $exe = "build/${{ matrix.configuration }}/bin/pyxis.exe"
+          if (-not (Test-Path $exe)) { throw "No se genero $exe" }
+
+          $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "pyxis.exe: $size MB"
+
+          # La razon de ser del proyecto es que no dependa de nada: si aparece
+          # una DLL de terceros entre las importaciones, el CI debe fallar.
+          $imports = (& dumpbin /DEPENDENTS $exe) -split "`n" |
+                     Where-Object { $_ -match '\.dll\s*$' } |
+                     ForEach-Object { $_.Trim().ToLower() }
+
+          $allowed = @(
+            'kernel32.dll','user32.dll','gdi32.dll','shell32.dll','ole32.dll',
+            'oleaut32.dll','advapi32.dll','shcore.dll','comdlg32.dll','dwmapi.dll',
+            'd3d11.dll','dxgi.dll','d2d1.dll','dwrite.dll','avrt.dll','winmm.dll',
+            'mf.dll','mfplat.dll','mfreadwrite.dll','propsys.dll','bcrypt.dll',
+            'secur32.dll','ws2_32.dll','version.dll','psapi.dll','userenv.dll',
+            'crypt32.dll','ntdll.dll','api-ms-win-core-synch-l1-2-0.dll'
+          )
+
+          $unexpected = $imports | Where-Object {
+            $_ -notin $allowed -and $_ -notlike 'api-ms-win-*'
+          }
+
+          if ($unexpected) {
+            Write-Host "::error::Dependencias inesperadas: $($unexpected -join ', ')"
+            exit 1
+          }
+          Write-Host "Solo depende de componentes del sistema."
+
+      - name: Publicar el binario
+        if: matrix.configuration == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyxis-windows-x64
+          path: build/release/bin/pyxis.exe
+          if-no-files-found: error

@@ -1,0 +1,28 @@
+# Build
+/build/
+/out/
+/bin/
+/obj/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+
+# vcpkg
+/vcpkg/
+/vcpkg_installed/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+CMakeSettings.json
+CMakeUserPresets.json
+
+# Local
+*.log
+/scratch/

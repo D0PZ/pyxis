@@ -1,0 +1,175 @@
+// ============================================================================
+//  main.cpp - Punto de entrada de Pyxis
+//
+//  Aqui solo ocurren cuatro cosas, en este orden y por este motivo:
+//
+//    1. CONCIENCIA DE PPP. Debe fijarse antes de crear ninguna ventana. Si no,
+//       Windows escala el programa por su cuenta en pantallas de alta densidad
+//       y el video se muestra reescalado por el sistema en lugar de a
+//       resolucion nativa, que es justo lo contrario de lo que busca este
+//       reproductor.
+//
+//    2. APARTAMENTO COM. Se elige MTA de forma deliberada. WASAPI crea sus
+//       objetos en el hilo principal y los usa desde el hilo de audio; en un
+//       apartamento monohilo eso exigiria marshalling y seria un error sutil
+//       de los que solo aparecen bajo carga. El unico componente que necesita
+//       STA es el dialogo de archivo, y ese se abre en su propio hilo.
+//
+//    3. ARGUMENTOS de la linea de comandos.
+//
+//    4. La aplicacion, con un unico manejador de excepciones alrededor.
+// ============================================================================
+
+#include "core/Error.hpp"
+#include "core/Log.hpp"
+#include "core/Text.hpp"
+#include "ui/Controller.hpp"
+
+#include <windows.h>
+#include <objbase.h>
+#include <shellapi.h>
+#include <shellscalingapi.h>
+
+#include <algorithm>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr const wchar_t* kUsage =
+    L"Pyxis " PYXIS_VERSION L"  -  reproductor de video para Windows 11 x64\n"
+    L"\n"
+    L"Uso:  pyxis [opciones] [archivo o URL]\n"
+    L"\n"
+    L"Opciones:\n"
+    L"  -f, --fullscreen     arrancar a pantalla completa\n"
+    L"      --no-hardware    desactivar la decodificacion por GPU (diagnostico)\n"
+    L"      --volume N       volumen inicial, de 0 a 100\n"
+    L"  -v, --verbose        registro detallado\n"
+    L"      --log ARCHIVO    duplicar el registro en un archivo\n"
+    L"  -h, --help           mostrar esta ayuda\n"
+    L"\n"
+    L"Controles:\n"
+    L"  Espacio / K          reproducir o pausar\n"
+    L"  Izq / Der            +- 5 s   (Mayus: 1 s, Ctrl: 60 s)\n"
+    L"  J / L                +- 10 s\n"
+    L"  0-9                  saltar al 0%-90% de la duracion\n"
+    L"  Arriba / Abajo       volumen\n"
+    L"  M                    silencio\n"
+    L"  F / F11 / doble clic pantalla completa\n"
+    L"  [ / ]                velocidad de reproduccion\n"
+    L"  Retroceso            velocidad normal\n"
+    L"  I                    estadisticas\n"
+    L"  O                    abrir archivo\n"
+    L"  Q / Esc              salir\n";
+
+struct ParsedCommandLine {
+    pyxis::Options options;
+    std::wstring   logFile;
+    bool           showHelp = false;
+};
+
+ParsedCommandLine ParseCommandLine() {
+    ParsedCommandLine parsed;
+
+    int count = 0;
+    wchar_t** argv = ::CommandLineToArgvW(::GetCommandLineW(), &count);
+    if (argv == nullptr) return parsed;
+
+    for (int i = 1; i < count; ++i) {
+        const std::wstring argument = argv[i];
+
+        const auto nextValue = [&]() -> std::wstring {
+            return (i + 1 < count) ? argv[++i] : std::wstring{};
+        };
+
+        if (argument == L"-h" || argument == L"--help") {
+            parsed.showHelp = true;
+        } else if (argument == L"-f" || argument == L"--fullscreen") {
+            parsed.options.startFullscreen = true;
+        } else if (argument == L"--no-hardware") {
+            parsed.options.disableHardware = true;
+        } else if (argument == L"-v" || argument == L"--verbose") {
+            parsed.options.verbose = true;
+        } else if (argument == L"--log") {
+            parsed.logFile = nextValue();
+        } else if (argument == L"--volume") {
+            const std::wstring value = nextValue();
+            if (!value.empty()) {
+                try {
+                    parsed.options.volume =
+                        std::min(1.0f, std::max(0.0f, std::stof(value) / 100.0f));
+                } catch (const std::exception&) {
+                    // Un volumen mal escrito no justifica no arrancar.
+                }
+            }
+        } else if (!argument.empty() && argument.front() != L'-') {
+            // Primer argumento suelto: el medio a reproducir.
+            if (parsed.options.path.empty()) parsed.options.path = argument;
+        }
+    }
+
+    ::LocalFree(argv);
+    return parsed;
+}
+
+// Una aplicacion /SUBSYSTEM:WINDOWS no tiene consola, asi que la ayuda y los
+// errores fatales se muestran en un cuadro de dialogo.
+void ShowMessage(const std::wstring& text, UINT icon) {
+    ::MessageBoxW(nullptr, text.c_str(), L"Pyxis", icon | MB_OK | MB_SETFOREGROUND);
+}
+
+}  // namespace
+
+int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR, int commandShow) {
+    // 1. PPP por monitor v2: Windows no reescala nada y la ventana recibe el
+    //    tamano real en pixeles, que es lo que necesita la cadena de
+    //    intercambio para presentar sin filtrado intermedio.
+    ::SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    const ParsedCommandLine parsed = ParseCommandLine();
+
+    if (parsed.showHelp) {
+        ShowMessage(kUsage, MB_ICONINFORMATION);
+        return 0;
+    }
+
+    pyxis::log::SetLevel(parsed.options.verbose ? pyxis::log::Level::Debug
+                                                : pyxis::log::Level::Info);
+    if (!parsed.logFile.empty()) {
+        pyxis::log::SetLogFile(parsed.logFile);
+    }
+
+    PYXIS_INFO("Pyxis {} arrancando", PYXIS_VERSION);
+
+    // 2. Apartamento COM multihilo (ver la nota de cabecera).
+    const HRESULT comInit = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(comInit)) {
+        ShowMessage(L"No se pudo inicializar COM.", MB_ICONERROR);
+        return 1;
+    }
+
+    int exitCode = 0;
+    try {
+        pyxis::Controller controller;
+        exitCode = controller.Run(parsed.options, commandShow);
+
+    } catch (const pyxis::Exception& error) {
+        PYXIS_ERROR("error fatal: {}", error.what());
+        ShowMessage(L"Pyxis no pudo continuar:\n\n" + pyxis::ToUtf16(error.what()),
+                    MB_ICONERROR);
+        exitCode = 1;
+
+    } catch (const std::exception& error) {
+        PYXIS_ERROR("excepcion no controlada: {}", error.what());
+        ShowMessage(L"Error inesperado:\n\n" + pyxis::ToUtf16(error.what()), MB_ICONERROR);
+        exitCode = 1;
+    }
+
+    PYXIS_INFO("Pyxis finalizado con codigo {}", exitCode);
+
+    ::CoUninitialize();
+    pyxis::log::Shutdown();
+    return exitCode;
+}

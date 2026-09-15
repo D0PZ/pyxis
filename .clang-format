@@ -1,0 +1,20 @@
+# Estilo de Pyxis: Google con lineas de 90 columnas.
+#
+# 90 y no 80: las llamadas a la API de Windows son largas de por si
+# (D3D11_SHADER_RESOURCE_VIEW_DESC, AvSetMmThreadCharacteristicsW) y a 80
+# columnas casi todas se parten, lo que las hace mas dificiles de leer que la
+# linea larga que se pretendia evitar.
+BasedOnStyle: Google
+Language: Cpp
+Standard: c++20
+ColumnLimit: 90
+IndentWidth: 4
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AlignConsecutiveAssignments: Consecutive
+AlignTrailingComments: true
+PointerAlignment: Left
+DerivePointerAlignment: false
+IncludeBlocks: Preserve
+SortIncludes: CaseSensitive

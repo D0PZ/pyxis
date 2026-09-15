@@ -1,0 +1,48 @@
+// ============================================================================
+//  pyxis.rc - Recursos incrustados en el ejecutable
+// ============================================================================
+#include <winres.h>
+
+// El manifiesto va incrustado como recurso en lugar de ir en un archivo .manifest
+// suelto: un unico ejecutable autocontenido es uno de los objetivos del proyecto.
+1 RT_MANIFEST "pyxis.manifest"
+
+// Icono de la aplicacion. El identificador 1 es el que busca Window.cpp y el
+// que usa el Explorador para el icono del archivo.
+1 ICON "pyxis.ico"
+
+// ---------------------------------------------------------------------------
+//  Informacion de version
+// ---------------------------------------------------------------------------
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION     0,1,0,0
+    PRODUCTVERSION  0,1,0,0
+    FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+    FILEFLAGS       VS_FF_DEBUG
+#else
+    FILEFLAGS       0x0L
+#endif
+    FILEOS          VOS_NT_WINDOWS32
+    FILETYPE        VFT_APP
+    FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"   // ingles (EE. UU.), juego de caracteres Unicode
+        BEGIN
+            VALUE "CompanyName",      "Pyxis"
+            VALUE "FileDescription",  "Pyxis - reproductor de video de alto rendimiento"
+            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "InternalName",     "pyxis"
+            VALUE "LegalCopyright",   "GPL-3.0-or-later"
+            VALUE "OriginalFilename", "pyxis.exe"
+            VALUE "ProductName",      "Pyxis"
+            VALUE "ProductVersion",   "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

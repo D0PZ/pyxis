@@ -1,0 +1,15 @@
+# Normaliza los finales de linea en el repositorio: LF dentro de git, CRLF en
+# el disco de Windows. Sin esto, cada clon en otra plataforma genera un diff
+# completo del arbol.
+* text=auto eol=crlf
+
+# Scripts que se ejecutan en entornos POSIX (CI de GitHub, WSL).
+*.sh text eol=lf
+
+# Binarios: que git no toque un solo byte.
+*.ico binary
+*.png binary
+*.jpg binary
+*.exe binary
+*.lib binary
+*.pdb binary
