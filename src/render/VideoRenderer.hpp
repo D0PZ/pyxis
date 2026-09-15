@@ -32,6 +32,28 @@
 
 namespace pyxis {
 
+// ---------------------------------------------------------------------------
+//  Encuadre: zoom y desplazamiento
+//
+//  El zoom NO se hace en el shader. Se hace agrandando el VIEWPORT, que puede
+//  salirse de los limites del destino: el rasterizador recorta lo que sobra y
+//  el pixel shader solo se ejecuta sobre lo que queda visible. Ampliar 8x un
+//  video 4K no cuesta 16 veces mas trabajo de fragmento, cuesta exactamente el
+//  mismo que llenar la ventana, y el muestreo bilineal del escalado sale gratis
+//  porque ya estaba ahi.
+//
+//  zoom = 1.0 significa "ajustado a la ventana", no "tamano original": el
+//  tamano original depende de la resolucion del video y del de la pantalla, y
+//  se calcula con ZoomForOriginalSize().
+// ---------------------------------------------------------------------------
+struct ViewTransform {
+    float zoom = 1.0f;
+    float panX = 0.0f;   // desplazamiento en pixeles de cliente
+    float panY = 0.0f;
+
+    [[nodiscard]] bool operator==(const ViewTransform&) const = default;
+};
+
 // Ajustes de imagen del usuario. Valores neutros = sin efecto.
 struct ImageAdjustments {
     float brightness = 0.0f;   // -1 .. +1
@@ -57,6 +79,37 @@ public:
         adjustments_ = adjustments;
     }
     [[nodiscard]] const ImageAdjustments& Adjustments() const noexcept { return adjustments_; }
+
+    void SetViewTransform(const ViewTransform& view) noexcept { view_ = view; }
+    [[nodiscard]] const ViewTransform& View() const noexcept { return view_; }
+
+    // ---- Geometria del encuadre ------------------------------------------
+    //
+    //  Publica y estatica a proposito: la interfaz necesita EXACTAMENTE los
+    //  mismos calculos para anclar el zoom bajo el raton y para limitar el
+    //  desplazamiento. Duplicar esa aritmetica en dos sitios es como se acaba
+    //  con un zoom que se desplaza medio pixel por rueda.
+
+    // Rectangulo del video ajustado a la ventana, conservando proporciones.
+    [[nodiscard]] static RECT ComputeFitRect(unsigned targetWidth, unsigned targetHeight,
+                                             int videoWidth, int videoHeight,
+                                             AVRational sampleAspect) noexcept;
+
+    // Aplica zoom y desplazamiento al rectangulo ajustado. Puede devolver un
+    // rectangulo mayor que la ventana: es lo que se espera al ampliar.
+    [[nodiscard]] static RECT ApplyView(const RECT& fitRect,
+                                        unsigned targetWidth, unsigned targetHeight,
+                                        const ViewTransform& view) noexcept;
+
+    // Limita el desplazamiento para que no aparezcan franjas vacias cuando la
+    // imagen es mayor que la ventana, y lo anula en el eje donde sea menor.
+    static void ClampPan(const RECT& fitRect, unsigned targetWidth, unsigned targetHeight,
+                         ViewTransform& view) noexcept;
+
+    // Zoom necesario para que un pixel del video ocupe un pixel de pantalla.
+    [[nodiscard]] static float ZoomForOriginalSize(const RECT& fitRect,
+                                                   int videoWidth,
+                                                   AVRational sampleAspect) noexcept;
 
     // Nits del blanco de referencia SDR. BT.2408 recomienda 203; subirlo hace
     // que el contenido HDR mapeado a SDR salga mas brillante.
@@ -124,11 +177,6 @@ private:
                        unsigned textureWidth, unsigned textureHeight,
                        bool hdrOutput) const;
 
-    // Calcula el rectangulo de destino que conserva la relacion de aspecto.
-    [[nodiscard]] static RECT ComputeLetterbox(unsigned targetWidth, unsigned targetHeight,
-                                               int videoWidth, int videoHeight,
-                                               AVRational sampleAspect) noexcept;
-
     Device* device_ = nullptr;
 
     ComPtr<ID3D11VertexShader> vertexShader_;
@@ -150,6 +198,7 @@ private:
     std::unordered_map<ViewKey, ComPtr<ID3D11ShaderResourceView>, ViewKeyHash> viewCache_;
 
     ImageAdjustments adjustments_{};
+    ViewTransform    view_{};
     float            sdrWhiteNits_ = 203.0f;   // BT.2408
     RECT             lastVideoRect_{};
 };

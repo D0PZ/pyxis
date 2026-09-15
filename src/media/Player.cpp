@@ -157,6 +157,10 @@ void Player::Close() noexcept {
     hasAudio_     = false;
     title_.clear();
 
+    stepPending_.store(false, std::memory_order_release);
+    displayedPts_.store(kNoTimestamp, std::memory_order_relaxed);
+    displayedDuration_.store(0, std::memory_order_relaxed);
+
     framesDecoded_.store(0, std::memory_order_relaxed);
     framesDropped_.store(0, std::memory_order_relaxed);
     framesLate_.store(0, std::memory_order_relaxed);
@@ -358,6 +362,12 @@ void Player::AudioDecodeThread() {
 Player::FrameSelection Player::SelectFrame(VideoFrame& out) {
     if (!hasVideo_) return FrameSelection::None;
 
+    // El avance manual manda sobre el reloj: mientras hay un paso pendiente se
+    // busca un fotograma concreto, no el que toque por tiempo.
+    if (stepPending_.load(std::memory_order_acquire)) {
+        return SelectSteppedFrame(out);
+    }
+
     const Micros now = clock_.Position();
     bool selected = false;
 
@@ -411,6 +421,8 @@ Player::FrameSelection Player::SelectFrame(VideoFrame& out) {
         }
     }
 
+    NoteDisplayedFrame(out);
+
     // Tasa real de presentacion, en ventanas de un segundo.
     const Micros nowReal = NowMicros();
     if (fpsWindowStart_ == 0) fpsWindowStart_ = nowReal;
@@ -428,6 +440,94 @@ Player::FrameSelection Player::SelectFrame(VideoFrame& out) {
     return FrameSelection::Updated;
 }
 
+void Player::NoteDisplayedFrame(const VideoFrame& frame) noexcept {
+    if (frame.pts != kNoTimestamp) {
+        displayedPts_.store(frame.pts, std::memory_order_relaxed);
+    }
+    if (frame.duration > 0) {
+        displayedDuration_.store(frame.duration, std::memory_order_relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Avance fotograma a fotograma
+// ---------------------------------------------------------------------------
+Player::FrameSelection Player::SelectSteppedFrame(VideoFrame& out) {
+    const Micros lowerBound = stepLowerBound_.load(std::memory_order_acquire);
+
+    for (;;) {
+        if (!pendingFrame_.IsValid()) {
+            if (!videoFrames_.TryPop(pendingFrame_)) {
+                // El fotograma buscado todavia se esta decodificando. Se
+                // conserva el que hay en pantalla -nada de fundidos a negro- y
+                // se reintenta en la siguiente presentacion.
+                return FrameSelection::None;
+            }
+        }
+
+        // Los fotogramas anteriores al objetivo son el precio de rebobinar
+        // hasta el fotograma clave: se descartan sin llegar a mostrarse.
+        if (pendingFrame_.pts != kNoTimestamp && pendingFrame_.pts < lowerBound) {
+            pendingFrame_ = VideoFrame{};
+            continue;
+        }
+
+        out = std::move(pendingFrame_);
+        pendingFrame_ = VideoFrame{};
+
+        // El reloj se planta exactamente en el fotograma mostrado. Asi la barra
+        // de progreso acompana al avance manual y, al reanudar, la reproduccion
+        // continua desde aqui y no desde donde estaba antes de empezar a pasar
+        // fotogramas.
+        if (out.pts != kNoTimestamp) clock_.Reset(out.pts);
+
+        NoteDisplayedFrame(out);
+        stepPending_.store(false, std::memory_order_release);
+        return FrameSelection::Updated;
+    }
+}
+
+void Player::StepFrame(int direction) {
+    if (!hasVideo_ || direction == 0) return;
+
+    const PlayerState current = state_.load(std::memory_order_acquire);
+    if (current == PlayerState::Idle || current == PlayerState::Failed) return;
+
+    // Avanzar de uno en uno implica pausa: no tiene sentido pedir un fotograma
+    // concreto mientras el reloj sigue corriendo por debajo.
+    Pause();
+
+    // Duracion de referencia del paso. Se prefiere la del fotograma en pantalla
+    // (correcta con tasa variable) y se cae a la nominal del flujo.
+    Micros step = displayedDuration_.load(std::memory_order_relaxed);
+    if (step <= 0) step = videoDecoder_.NominalFrameDuration();
+    if (step <= 0) step = kMicrosPerSecond / 25;   // ultimo recurso
+
+    Micros position = displayedPts_.load(std::memory_order_relaxed);
+    if (position == kNoTimestamp) position = clock_.Position();
+
+    if (direction > 0) {
+        // Adelante: el siguiente fotograma ya esta en la cola o en camino. El
+        // umbral a media duracion descarta el actual sin descartar el siguiente.
+        stepLowerBound_.store(position + step / 2, std::memory_order_release);
+        stepPending_.store(true, std::memory_order_release);
+        return;
+    }
+
+    // Atras: hay que rebobinar y redecodificar. El umbral se situa a una
+    // duracion y media, que es el unico punto que deja fuera al ante-anterior
+    // y dentro al anterior:
+    //
+    //      ... P-2        P-1        P (en pantalla)
+    //           |    umbral |         |
+    //           |<-- 1.5 duraciones ->|
+    const Micros target = position - step;
+    stepLowerBound_.store(position - step - step / 2, std::memory_order_release);
+    stepPending_.store(true, std::memory_order_release);
+
+    RequestSeekInternal(target > 0 ? target : 0);
+}
+
 // ---------------------------------------------------------------------------
 //  Control de reproduccion
 // ---------------------------------------------------------------------------
@@ -440,6 +540,10 @@ void Player::Play() {
     if (current == PlayerState::Ended) {
         Seek(0);
     }
+
+    // Un paso a medias dejaria el reloj clavado esperando un fotograma que
+    // ya no interesa.
+    stepPending_.store(false, std::memory_order_release);
 
     clock_.SetPaused(false);
     audio_.SetPaused(false);
@@ -469,6 +573,8 @@ void Player::Seek(Micros target) {
         target = 0;
     }
 
+    // Un salto normal invalida cualquier paso en curso.
+    stepPending_.store(false, std::memory_order_release);
     RequestSeekInternal(target);
 }
 

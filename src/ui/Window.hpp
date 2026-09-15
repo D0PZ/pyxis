@@ -33,12 +33,22 @@ public:
     struct Callbacks {
         std::function<void(unsigned width, unsigned height)> onResize;
         std::function<void(const std::vector<std::wstring>& paths)> onFilesDropped;
-        std::function<void(int virtualKey, bool shift, bool control)> onKeyDown;
+        // `repeated` distingue la pulsacion real de la autorrepeticion del
+        // teclado. El avance fotograma a fotograma marca su propio ritmo, asi
+        // que ignora la repeticion del sistema en lugar de heredar la cadencia
+        // que cada usuario tenga configurada en el panel de control.
+        std::function<void(int virtualKey, bool shift, bool control, bool repeated)> onKeyDown;
+        std::function<void(int virtualKey)> onKeyUp;
+
+        // Al perder el foco no llega ningun WM_KEYUP, asi que sin esto una
+        // tecla mantenida se quedaria "pulsada" para siempre.
+        std::function<void()> onFocusLost;
+
         std::function<void(int x, int y)> onMouseMove;
         std::function<void(int x, int y)> onLeftButtonDown;
         std::function<void(int x, int y)> onLeftButtonUp;
         std::function<void()> onDoubleClick;
-        std::function<void(int wheelDelta)> onWheel;
+        std::function<void(int wheelDelta, int x, int y, bool control)> onWheel;
         std::function<void()> onClose;
     };
 

@@ -353,9 +353,9 @@ bool VideoRenderer::UploadSoftwareFrame(const VideoFrame& frame) {
 // ---------------------------------------------------------------------------
 //  Geometria
 // ---------------------------------------------------------------------------
-RECT VideoRenderer::ComputeLetterbox(unsigned targetWidth, unsigned targetHeight,
-                                     int videoWidth, int videoHeight,
-                                     AVRational sampleAspect) noexcept {
+RECT VideoRenderer::ComputeFitRect(unsigned targetWidth, unsigned targetHeight,
+                                   int videoWidth, int videoHeight,
+                                   AVRational sampleAspect) noexcept {
     RECT result{0, 0, static_cast<LONG>(targetWidth), static_cast<LONG>(targetHeight)};
     if (videoWidth <= 0 || videoHeight <= 0 || targetWidth == 0 || targetHeight == 0) {
         return result;
@@ -391,6 +391,62 @@ RECT VideoRenderer::ComputeLetterbox(unsigned targetWidth, unsigned targetHeight
     result.right  = left + static_cast<LONG>(std::lround(width));
     result.bottom = top + static_cast<LONG>(std::lround(height));
     return result;
+}
+
+RECT VideoRenderer::ApplyView(const RECT& fitRect,
+                              unsigned targetWidth, unsigned targetHeight,
+                              const ViewTransform& view) noexcept {
+    const float fitWidth  = static_cast<float>(fitRect.right - fitRect.left);
+    const float fitHeight = static_cast<float>(fitRect.bottom - fitRect.top);
+
+    const float width  = fitWidth * view.zoom;
+    const float height = fitHeight * view.zoom;
+
+    // El desplazamiento se mide desde el centro de la ventana, no desde la
+    // esquina: asi el zoom sin desplazamiento siempre queda centrado, sea cual
+    // sea la proporcion del video.
+    const float centerX = static_cast<float>(targetWidth) * 0.5f + view.panX;
+    const float centerY = static_cast<float>(targetHeight) * 0.5f + view.panY;
+
+    RECT result;
+    result.left   = static_cast<LONG>(std::lround(centerX - width * 0.5f));
+    result.top    = static_cast<LONG>(std::lround(centerY - height * 0.5f));
+    result.right  = result.left + static_cast<LONG>(std::lround(width));
+    result.bottom = result.top + static_cast<LONG>(std::lround(height));
+    return result;
+}
+
+void VideoRenderer::ClampPan(const RECT& fitRect,
+                             unsigned targetWidth, unsigned targetHeight,
+                             ViewTransform& view) noexcept {
+    const float width  = static_cast<float>(fitRect.right - fitRect.left) * view.zoom;
+    const float height = static_cast<float>(fitRect.bottom - fitRect.top) * view.zoom;
+
+    // En el eje donde la imagen no llena la ventana, el desplazamiento se anula:
+    // dejar que el usuario arrastre una imagen pequena por la pantalla es
+    // desconcertante y no sirve para nada.
+    const float slackX = (width - static_cast<float>(targetWidth)) * 0.5f;
+    const float slackY = (height - static_cast<float>(targetHeight)) * 0.5f;
+
+    view.panX = slackX > 0.0f ? std::clamp(view.panX, -slackX, slackX) : 0.0f;
+    view.panY = slackY > 0.0f ? std::clamp(view.panY, -slackY, slackY) : 0.0f;
+}
+
+float VideoRenderer::ZoomForOriginalSize(const RECT& fitRect, int videoWidth,
+                                         AVRational sampleAspect) noexcept {
+    const float fitWidth = static_cast<float>(fitRect.right - fitRect.left);
+    if (fitWidth <= 0.0f || videoWidth <= 0) return 1.0f;
+
+    // El tamano "original" es el de PRESENTACION, no el de almacenamiento: en
+    // material anamorfico (DVD, cine rodado con lentes anamorficas) los pixeles
+    // no son cuadrados y mostrar la anchura almacenada saldria achatado.
+    float displayWidth = static_cast<float>(videoWidth);
+    if (sampleAspect.num > 0 && sampleAspect.den > 0) {
+        displayWidth *= static_cast<float>(sampleAspect.num) /
+                        static_cast<float>(sampleAspect.den);
+    }
+
+    return displayWidth / fitWidth;
 }
 
 void VideoRenderer::FillConstants(Constants& out, const VideoFrame& frame,
@@ -495,9 +551,11 @@ void VideoRenderer::Draw(SwapChain& swapChain, const VideoFrame& frame,
     std::memcpy(mapped.pData, &constants, sizeof(constants));
     context->Unmap(constantBuffer_.Get(), 0);
 
-    // Viewport = rectangulo util. El shader solo corre sobre esos pixeles.
-    const RECT destination = ComputeLetterbox(swapChain.Width(), swapChain.Height(),
-                                              frame.width, frame.height, sampleAspect);
+    // Viewport = rectangulo util. Al ampliar puede desbordar la ventana; el
+    // rasterizador recorta y el shader solo corre sobre lo visible.
+    const RECT fitRect = ComputeFitRect(swapChain.Width(), swapChain.Height(),
+                                        frame.width, frame.height, sampleAspect);
+    const RECT destination = ApplyView(fitRect, swapChain.Width(), swapChain.Height(), view_);
     lastVideoRect_ = destination;
 
     D3D11_VIEWPORT viewport{};

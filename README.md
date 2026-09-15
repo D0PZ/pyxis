@@ -82,12 +82,18 @@ pyxis [opciones] [archivo o URL]
 | Tecla | Acción |
 |---|---|
 | `Espacio` · `K` | reproducir / pausar |
-| `←` `→` | ± 5 s (`Mayús`: 1 s · `Ctrl`: 60 s) |
+| `←` `→` | **un fotograma** atrás / adelante — mantener pulsado avanza a 20 fps |
+| `Mayús`+`←` `→` | ± 5 s |
+| `Ctrl`+`←` `→` | ± 60 s |
 | `J` `L` | ± 10 s |
 | `0`–`9` | saltar al 0 %–90 % |
 | `↑` `↓` · rueda | volumen |
 | `M` | silencio |
 | `F` · `F11` · doble clic | pantalla completa |
+| `Ctrl`+rueda | **zoom anclado al puntero** |
+| arrastrar | desplazar la imagen ampliada |
+| `Z` | ajustar a la ventana |
+| `X` | tamaño original (1:1) |
 | `[` `]` | velocidad de reproducción |
 | `Retroceso` | velocidad normal |
 | `I` | panel de estadísticas |
@@ -95,6 +101,36 @@ pyxis [opciones] [archivo o URL]
 | `Q` · `Esc` | salir |
 
 También acepta archivos arrastrados sobre la ventana.
+
+### Avance fotograma a fotograma
+
+Las flechas dan **exactamente un fotograma**. Al mantenerlas pulsadas se repite
+a 20 fotogramas por segundo — un ritmo propio, no el de la autorrepetición del
+teclado, para que revisar un plano se sienta igual en cualquier equipo.
+
+Avanzar es inmediato: el siguiente fotograma ya viene de camino. **Retroceder
+cuesta más**, y no por descuido: un códec inter-fotograma solo puede empezar a
+decodificar en un fotograma clave, así que ir uno atrás obliga a rebobinar hasta
+la clave anterior y redecodificar hacia delante. Con GOP corto es instantáneo;
+con GOP largo (dos segundos es habitual en HEVC) el retroceso mantenido va más
+despacio. Pyxis espera a que cada paso aterrice antes de pedir el siguiente, de
+modo que el ritmo se ajusta solo a lo que la máquina aguanta en vez de acumular
+peticiones.
+
+### Zoom
+
+`Ctrl`+rueda amplía **sobre el punto donde está el ratón**, no hacia el centro,
+que es lo que hace falta para inspeccionar una esquina. Con la imagen ampliada,
+arrastrar con el botón izquierdo la desplaza; un clic sin arrastre sigue siendo
+pausa.
+
+El zoom no se hace en el shader, sino agrandando el *viewport*. El rasterizador
+recorta lo que se sale y el pixel shader solo se ejecuta sobre lo visible, así
+que ampliar 8× cuesta lo mismo que llenar la ventana.
+
+`Z` vuelve al ajuste a la ventana y `X` muestra el vídeo a tamaño original —un
+píxel del vídeo por píxel de pantalla—, corrigiendo la relación de aspecto del
+píxel en material anamórfico.
 
 ## Compilar
 

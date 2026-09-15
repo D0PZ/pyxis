@@ -68,15 +68,31 @@ private:
 
     void ApplyPendingResize();
     void UpdateHdrMode(const VideoFrame& frame);
+
+    // Emite un paso mientras la flecha siga pulsada. Lo llama el hilo de
+    // presentacion, que ya despierta a cada refresco: montar un temporizador
+    // aparte solo anadiria otro hilo para el mismo resultado.
+    void UpdateFrameStepping();
+
+    // ---- Encuadre ---------------------------------------------------------
+    [[nodiscard]] ViewTransform CurrentView() const;
+    [[nodiscard]] RECT          CurrentFitRect() const;
+
+    void ZoomAt(int x, int y, float factor);
+    void ApplyFitView();
+    void ApplyOriginalSizeView();
+    void ResetView();
     void BuildOverlayModel(OverlayModel& model);
     [[nodiscard]] std::wstring BuildStatsText() const;
 
     // Entrada
-    void OnKeyDown(int virtualKey, bool shift, bool control);
+    void OnKeyDown(int virtualKey, bool shift, bool control, bool repeated);
+    void OnKeyUp(int virtualKey);
+    void OnFocusLost();
     void OnMouseMove(int x, int y);
     void OnLeftButtonDown(int x, int y);
     void OnLeftButtonUp(int x, int y);
-    void OnWheel(int delta);
+    void OnWheel(int delta, int x, int y, bool control);
     void OnFilesDropped(const std::vector<std::wstring>& paths);
 
     void OpenMedia(const std::wstring& path);
@@ -107,6 +123,28 @@ private:
     std::atomic<Micros> lastActivity_{0};
     std::atomic<bool>   showStats_{false};
     std::atomic<bool>   seeking_{false};
+
+    // Avance fotograma a fotograma mientras se mantiene una flecha.
+    std::atomic<int>    stepDirection_{0};   // -1, 0, +1
+    std::atomic<Micros> nextStepAt_{0};
+
+    // Encuadre. Lo escribe el hilo de interfaz y lo lee el de presentacion en
+    // cada fotograma, de ahi el cerrojo. Es una estructura de doce bytes que se
+    // toca unas pocas veces por segundo: el coste es irrelevante y el codigo
+    // queda mas claro que con tres atomicos sueltos que podrian leerse
+    // desparejados a mitad de un zoom.
+    mutable std::mutex viewMutex_;
+    ViewTransform      view_{};
+
+    // Tamano del area de cliente, publicado por el hilo de interfaz.
+    std::atomic<unsigned> clientWidth_{0};
+    std::atomic<unsigned> clientHeight_{0};
+
+    // Arrastre con el boton izquierdo. Solo lo toca el hilo de interfaz.
+    bool          leftButtonDown_ = false;
+    bool          dragMoved_      = false;
+    POINT         dragOrigin_{};
+    ViewTransform dragStartView_{};
 
     mutable std::mutex toastMutex_;
     std::wstring       toastText_;

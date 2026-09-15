@@ -148,11 +148,28 @@ LRESULT Window::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             const bool shift   = (::GetKeyState(VK_SHIFT) & 0x8000) != 0;
             const bool control = (::GetKeyState(VK_CONTROL) & 0x8000) != 0;
 
+            // Bit 30 de lParam: estado anterior de la tecla. Si ya estaba
+            // pulsada, este mensaje lo genero la autorrepeticion de Windows.
+            const bool repeated = (lParam & (1LL << 30)) != 0;
+
             if (callbacks_.onKeyDown) {
-                callbacks_.onKeyDown(static_cast<int>(wParam), shift, control);
+                callbacks_.onKeyDown(static_cast<int>(wParam), shift, control, repeated);
             }
             // Alt+F4 y demas combinaciones del sistema deben seguir su curso.
             if (message == WM_SYSKEYDOWN && wParam == VK_F4) break;
+            return 0;
+        }
+
+        case WM_KEYUP:
+        case WM_SYSKEYUP: {
+            if (callbacks_.onKeyUp) callbacks_.onKeyUp(static_cast<int>(wParam));
+            return 0;
+        }
+
+        case WM_KILLFOCUS: {
+            // Sin esto, soltar la tecla con la ventana ya desenfocada dejaria
+            // el avance por fotogramas corriendo indefinidamente.
+            if (callbacks_.onFocusLost) callbacks_.onFocusLost();
             return 0;
         }
 
@@ -188,7 +205,16 @@ LRESULT Window::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 
         case WM_MOUSEWHEEL: {
             if (callbacks_.onWheel) {
-                callbacks_.onWheel(GET_WHEEL_DELTA_WPARAM(wParam));
+                // WM_MOUSEWHEEL trae las coordenadas en espacio de PANTALLA,
+                // no de cliente, a diferencia del resto de mensajes de raton.
+                // Olvidarlo hace que el zoom se ancle en el punto equivocado
+                // en cuanto la ventana no esta en el origen del escritorio.
+                POINT cursor{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                ::ScreenToClient(window_, &cursor);
+
+                const bool control = (::GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                callbacks_.onWheel(GET_WHEEL_DELTA_WPARAM(wParam),
+                                   cursor.x, cursor.y, control);
             }
             return 0;
         }

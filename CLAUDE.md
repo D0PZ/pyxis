@@ -129,8 +129,12 @@ guarda fotogramas de referencia internos.
 La solución es un **contador de generación** (`Player::generation_`):
 
 1. Quien pide el salto incrementa el contador.
-2. Vacía las tres colas con `BeginFlush`, lo que además despierta a los hilos
-   bloqueados.
+2. Vacía las tres colas con `Flush`, lo que además despierta a los hilos
+   bloqueados. El vaciado se señaliza con una **época**, no con una bandera:
+   cada operación compara el valor que vio al entrar con el actual, así que
+   quien esperaba se entera una vez y quien llegue después se bloquea con
+   normalidad. Con una bandera persistente, los hilos de decodificación girarían
+   en vacío hasta que alguien la bajara.
 3. Publica el destino y levanta `seekPending_`.
 4. El hilo de demultiplexado ve la bandera, ejecuta el salto (es el único dueño
    del `AVFormatContext`) y empieza a etiquetar con la generación nueva.
@@ -171,6 +175,35 @@ estirarlo**. Subirle el brillo para «aprovechar» el HDR es justo lo que hace q
 el SDR se vea mal en modo HDR.
 
 ---
+
+## Avance fotograma a fotograma y encuadre
+
+**Pasos.** `Player::StepFrame` no mueve el reloj y espera: publica un umbral
+(`stepLowerBound_`) y marca `stepPending_`. La siguiente llamada a
+`SelectFrame` se desvía a `SelectSteppedFrame`, que descarta todo lo anterior al
+umbral y se planta en el primer fotograma que lo alcanza. Si aún no ha llegado,
+devuelve `None` y se conserva el fotograma en pantalla: así retroceder no
+produce un parpadeo mientras se redecodifica el GOP.
+
+El umbral del paso atrás está a **1,5 duraciones** por debajo del fotograma
+actual. Es el único valor que deja fuera al ante-anterior y dentro al anterior;
+con una duración justa, el redondeo de PTS hace que a veces caiga en el
+equivocado.
+
+Quien mantenga pulsada la flecha debe consultar `StepPending()` antes de pedir
+otro paso. Sin eso, el retroceso en material con GOP largo acumula peticiones
+que el decodificador nunca puede atender.
+
+**Encuadre.** El zoom se aplica al *viewport*, no en el shader. Un viewport de
+D3D11 puede salirse del destino y el rasterizador recorta, así que ampliar no
+cuesta trabajo de fragmento adicional. `zoom = 1.0` significa «ajustado a la
+ventana», **no** tamaño original: eso último depende de la resolución del vídeo
+y se calcula con `ZoomForOriginalSize`, que además corrige la relación de
+aspecto del píxel.
+
+El estado vive en `Controller::view_` bajo cerrojo (lo escribe la interfaz, lo
+lee la presentación en cada fotograma) y se publica con `SetViewTransform`
+justo antes de dibujar.
 
 ## Trampas conocidas
 
@@ -266,4 +299,11 @@ primera herramienta a mirar** ante cualquier problema de fluidez:
   el `static_assert` del tamaño en `VideoRenderer.hpp`. Ese assert existe
   precisamente para que un desajuste falle al compilar y no en pantalla.
 - **Nuevo atajo de teclado** → `Controller::OnKeyDown` y la tabla del README.
+  Ojo: ese manejador descarta la autorrepetición del sistema (`repeated`), así
+  que una acción que deba repetirse al mantener la tecla necesita su propio
+  temporizador en el hilo de presentación, como hace `UpdateFrameStepping`.
+- **Nuevo modo de encuadre** → `ViewTransform` en `render/VideoRenderer.hpp`. La
+  aritmética de geometría vive en los estáticos públicos de `VideoRenderer`
+  (`ComputeFitRect`, `ApplyView`, `ClampPan`) precisamente para que la interfaz
+  y el renderizador no puedan divergir. No la dupliques en `Controller`.
 - **Nueva métrica** → `PlayerStats` y `Controller::BuildStatsText`.

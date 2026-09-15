@@ -121,8 +121,43 @@ public:
     [[nodiscard]] const std::wstring& Title() const noexcept { return title_; }
     [[nodiscard]] AVRational SampleAspectRatio() const noexcept { return sampleAspect_; }
 
+    // Dimensiones codificadas del video. Solo cambian al abrir un medio, asi
+    // que el hilo de interfaz puede leerlas para calcular el encuadre.
+    [[nodiscard]] int VideoWidth() const noexcept { return videoDecoder_.Width(); }
+    [[nodiscard]] int VideoHeight() const noexcept { return videoDecoder_.Height(); }
+
     // Mensaje del ultimo error, si el estado es Failed.
     [[nodiscard]] std::string LastError() const;
+
+    // ---- Avance fotograma a fotograma ------------------------------------
+    //
+    //  Adelante es barato: el siguiente fotograma ya viene de camino en la
+    //  cola, basta con tomarlo sin esperar al reloj.
+    //
+    //  Atras es caro, y no por descuido. Un codec inter-fotograma solo puede
+    //  empezar a decodificar en un fotograma clave, asi que retroceder UNO
+    //  obliga a rebobinar hasta la clave anterior y redecodificar hacia
+    //  delante hasta el objetivo. Con GOP corto es inmediato; con GOP largo
+    //  (dos segundos es habitual en HEVC) puede costar decenas de fotogramas
+    //  de trabajo. Por eso StepPending() existe: quien mantenga la tecla
+    //  pulsada debe esperar a que el paso anterior aterrice en lugar de
+    //  encolar peticiones que el decodificador no puede absorber.
+    void StepFrame(int direction);   // -1 atras, +1 adelante
+
+    // Cierto mientras un paso solicitado aun no ha llegado a pantalla.
+    [[nodiscard]] bool StepPending() const noexcept {
+        return stepPending_.load(std::memory_order_acquire);
+    }
+
+    // Marca de tiempo del fotograma que hay en pantalla ahora mismo.
+    [[nodiscard]] Micros DisplayedPts() const noexcept {
+        return displayedPts_.load(std::memory_order_relaxed);
+    }
+
+    // Duracion del fotograma actual. Es lo que mide un "paso".
+    [[nodiscard]] Micros DisplayedFrameDuration() const noexcept {
+        return displayedDuration_.load(std::memory_order_relaxed);
+    }
 
     enum class FrameSelection {
         None,       // no hay fotograma nuevo; conservar el anterior
@@ -145,6 +180,11 @@ private:
 
     void RequestSeekInternal(Micros target);
     void SetFailed(const std::string& message);
+
+    // Rama de SelectFrame cuando hay un paso pendiente: ignora el reloj y
+    // busca el fotograma concreto que se pidio.
+    [[nodiscard]] FrameSelection SelectSteppedFrame(VideoFrame& out);
+    void NoteDisplayedFrame(const VideoFrame& frame) noexcept;
 
     // Un paquete etiquetado con la generacion en que se leyo.
     struct TaggedPacket {
@@ -186,6 +226,17 @@ private:
 
     // Fotograma ya extraido de la cola pero cuyo momento aun no ha llegado.
     VideoFrame pendingFrame_;
+
+    // Coordinacion del avance por fotogramas. `stepLowerBound_` es la marca de
+    // tiempo minima que debe tener el fotograma buscado: los que lleguen antes
+    // se descartan sin mostrarse.
+    std::atomic<bool>   stepPending_{false};
+    std::atomic<Micros> stepLowerBound_{0};
+
+    // Estado del fotograma en pantalla. Lo escribe el hilo de presentacion y lo
+    // lee el de interfaz para decidir a donde saltar en el siguiente paso.
+    std::atomic<Micros> displayedPts_{kNoTimestamp};
+    std::atomic<Micros> displayedDuration_{0};
 
     Micros       duration_     = kNoTimestamp;
     AVRational   sampleAspect_ = AVRational{1, 1};
