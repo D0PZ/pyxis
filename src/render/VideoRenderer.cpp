@@ -496,54 +496,43 @@ void VideoRenderer::Clear(SwapChain& swapChain) {
     lastVideoRect_ = RECT{};
 }
 
-void VideoRenderer::Draw(SwapChain& swapChain, const VideoFrame& frame,
-                         AVRational sampleAspect) {
-    ID3D11DeviceContext* context = device_->Context();
-    ID3D11RenderTargetView* target = swapChain.BackBufferView();
-    if (target == nullptr || !frame.IsValid()) return;
-
-    // Las bandas negras se pintan siempre: si no, al cambiar de un video 16:9 a
-    // uno 4:3 quedarian restos del anterior en los bordes.
-    static constexpr float kBlack[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    context->ClearRenderTargetView(target, kBlack);
-
-    ID3D11ShaderResourceView* lumaView   = nullptr;
-    ID3D11ShaderResourceView* chromaView = nullptr;
-    unsigned textureWidth  = static_cast<unsigned>(frame.width);
-    unsigned textureHeight = static_cast<unsigned>(frame.height);
-    DXGI_FORMAT lumaFormat = DXGI_FORMAT_R8_UNORM;
+VideoRenderer::BoundFrame VideoRenderer::BindFrame(const VideoFrame& frame) {
+    BoundFrame bound;
+    if (!frame.IsValid()) return bound;
 
     if (frame.IsHardware()) {
         D3D11_TEXTURE2D_DESC description{};
         frame.texture->GetDesc(&description);
-        textureWidth  = description.Width;
-        textureHeight = description.Height;
+        bound.textureWidth  = description.Width;
+        bound.textureHeight = description.Height;
 
         const PlaneFormats formats = PlaneFormatsFor(description.Format);
-        lumaFormat = formats.luma;
+        bound.lumaFormat = formats.luma;
 
-        lumaView   = AcquireView(frame.texture, frame.arraySlice, 0, formats.luma);
-        chromaView = AcquireView(frame.texture, frame.arraySlice, 1, formats.chroma);
-    } else {
-        if (!UploadSoftwareFrame(frame)) return;
-        lumaView   = softwareLumaView_.Get();
-        chromaView = softwareChromaView_.Get();
-        // Las texturas por software se crean con el tamano exacto, asi que no
-        // hay relleno que compensar.
-        textureWidth  = static_cast<unsigned>(softwareWidth_);
-        textureHeight = static_cast<unsigned>(softwareHeight_);
-        lumaFormat = (softwareFormat_ == AV_PIX_FMT_P010LE ||
-                      softwareFormat_ == AV_PIX_FMT_P016LE)
-                         ? DXGI_FORMAT_R16_UNORM
-                         : DXGI_FORMAT_R8_UNORM;
+        bound.luma   = AcquireView(frame.texture, frame.arraySlice, 0, formats.luma);
+        bound.chroma = AcquireView(frame.texture, frame.arraySlice, 1, formats.chroma);
+        return bound;
     }
 
-    if (lumaView == nullptr || chromaView == nullptr) return;
+    if (!UploadSoftwareFrame(frame)) return bound;
 
-    // Constantes
-    Constants constants{};
-    FillConstants(constants, frame, textureWidth, textureHeight, swapChain.IsHdrOutput());
-    constants.bitScale = BitScaleFor(frame.color, lumaFormat);
+    bound.luma   = softwareLumaView_.Get();
+    bound.chroma = softwareChromaView_.Get();
+    // Las texturas por software se crean con el tamano exacto, asi que no hay
+    // relleno que compensar.
+    bound.textureWidth  = static_cast<unsigned>(softwareWidth_);
+    bound.textureHeight = static_cast<unsigned>(softwareHeight_);
+    bound.lumaFormat    = (softwareFormat_ == AV_PIX_FMT_P010LE ||
+                           softwareFormat_ == AV_PIX_FMT_P016LE)
+                              ? DXGI_FORMAT_R16_UNORM
+                              : DXGI_FORMAT_R8_UNORM;
+    return bound;
+}
+
+void VideoRenderer::IssueDraw(ID3D11RenderTargetView* target,
+                              const D3D11_VIEWPORT& viewport,
+                              const BoundFrame& bound, const Constants& constants) {
+    ID3D11DeviceContext* context = device_->Context();
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
     PYXIS_CHECK_HR(context->Map(constantBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped),
@@ -551,23 +540,8 @@ void VideoRenderer::Draw(SwapChain& swapChain, const VideoFrame& frame,
     std::memcpy(mapped.pData, &constants, sizeof(constants));
     context->Unmap(constantBuffer_.Get(), 0);
 
-    // Viewport = rectangulo util. Al ampliar puede desbordar la ventana; el
-    // rasterizador recorta y el shader solo corre sobre lo visible.
-    const RECT fitRect = ComputeFitRect(swapChain.Width(), swapChain.Height(),
-                                        frame.width, frame.height, sampleAspect);
-    const RECT destination = ApplyView(fitRect, swapChain.Width(), swapChain.Height(), view_);
-    lastVideoRect_ = destination;
-
-    D3D11_VIEWPORT viewport{};
-    viewport.TopLeftX = static_cast<float>(destination.left);
-    viewport.TopLeftY = static_cast<float>(destination.top);
-    viewport.Width    = static_cast<float>(destination.right - destination.left);
-    viewport.Height   = static_cast<float>(destination.bottom - destination.top);
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-
-    ID3D11ShaderResourceView* views[2] = {lumaView, chromaView};
-    ID3D11Buffer*             buffers[1] = {constantBuffer_.Get()};
+    ID3D11ShaderResourceView* views[2]    = {bound.luma, bound.chroma};
+    ID3D11Buffer*             buffers[1]  = {constantBuffer_.Get()};
     ID3D11SamplerState*       samplers[1] = {sampler_.Get()};
 
     context->OMSetRenderTargets(1, &target, nullptr);
@@ -590,6 +564,100 @@ void VideoRenderer::Draw(SwapChain& swapChain, const VideoFrame& frame,
     // destino de decodificacion en el siguiente fotograma.
     ID3D11ShaderResourceView* none[2] = {nullptr, nullptr};
     context->PSSetShaderResources(0, 2, none);
+}
+
+void VideoRenderer::Draw(SwapChain& swapChain, const VideoFrame& frame,
+                         AVRational sampleAspect) {
+    ID3D11RenderTargetView* target = swapChain.BackBufferView();
+    if (target == nullptr || !frame.IsValid()) return;
+
+    // Las bandas negras se pintan siempre: si no, al cambiar de un video 16:9 a
+    // uno 4:3 quedarian restos del anterior en los bordes.
+    static constexpr float kBlack[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    device_->Context()->ClearRenderTargetView(target, kBlack);
+
+    const BoundFrame bound = BindFrame(frame);
+    if (!bound.Valid()) return;
+
+    Constants constants{};
+    FillConstants(constants, frame, bound.textureWidth, bound.textureHeight,
+                  swapChain.IsHdrOutput());
+    constants.bitScale = BitScaleFor(frame.color, bound.lumaFormat);
+
+    // Viewport = rectangulo util. Al ampliar puede desbordar la ventana; el
+    // rasterizador recorta y el shader solo corre sobre lo visible.
+    const RECT fitRect = ComputeFitRect(swapChain.Width(), swapChain.Height(),
+                                        frame.width, frame.height, sampleAspect);
+    const RECT destination = ApplyView(fitRect, swapChain.Width(), swapChain.Height(), view_);
+    lastVideoRect_ = destination;
+
+    D3D11_VIEWPORT viewport{};
+    viewport.TopLeftX = static_cast<float>(destination.left);
+    viewport.TopLeftY = static_cast<float>(destination.top);
+    viewport.Width    = static_cast<float>(destination.right - destination.left);
+    viewport.Height   = static_cast<float>(destination.bottom - destination.top);
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+
+    IssueDraw(target, viewport, bound, constants);
+}
+
+ComPtr<ID3D11Texture2D> VideoRenderer::RenderToTexture(const VideoFrame& frame,
+                                                       AVRational sampleAspect) {
+    ComPtr<ID3D11Texture2D> result;
+    if (!frame.IsValid() || frame.width <= 0 || frame.height <= 0) return result;
+
+    // Tamano de PRESENTACION: en material anamorfico la anchura almacenada no
+    // es la que hay que guardar, o la captura saldria achatada.
+    unsigned width = static_cast<unsigned>(frame.width);
+    if (sampleAspect.num > 0 && sampleAspect.den > 0 && sampleAspect.num != sampleAspect.den) {
+        width = static_cast<unsigned>(std::lround(
+            static_cast<double>(frame.width) * sampleAspect.num / sampleAspect.den));
+    }
+    const auto height = static_cast<unsigned>(frame.height);
+
+    D3D11_TEXTURE2D_DESC description{};
+    description.Width      = width;
+    description.Height     = height;
+    description.MipLevels  = 1;
+    description.ArraySize  = 1;
+    description.Format     = DXGI_FORMAT_B8G8R8A8_UNORM;   // el que espera WIC
+    description.SampleDesc = {1, 0};
+    description.Usage      = D3D11_USAGE_DEFAULT;
+    description.BindFlags  = D3D11_BIND_RENDER_TARGET;
+
+    PYXIS_CHECK_HR(device_->Handle()->CreateTexture2D(&description, nullptr, &result),
+                   "no se pudo crear la textura de destino de la captura");
+
+    ComPtr<ID3D11RenderTargetView> target;
+    PYXIS_CHECK_HR(device_->Handle()->CreateRenderTargetView(result.Get(), nullptr, &target),
+                   "no se pudo crear el destino de render de la captura");
+
+    const BoundFrame bound = BindFrame(frame);
+    if (!bound.Valid()) {
+        result.Reset();
+        return result;
+    }
+
+    // Salida SDR y sin ajustes de encuadre: una captura debe reflejar el
+    // fotograma, no como estaba encuadrado en la ventana en ese momento.
+    Constants constants{};
+    FillConstants(constants, frame, bound.textureWidth, bound.textureHeight, false);
+    constants.bitScale = BitScaleFor(frame.color, bound.lumaFormat);
+
+    D3D11_VIEWPORT viewport{};
+    viewport.Width    = static_cast<float>(width);
+    viewport.Height   = static_cast<float>(height);
+    viewport.MaxDepth = 1.0f;
+
+    IssueDraw(target.Get(), viewport, bound, constants);
+
+    // El estado del contexto queda apuntando a esta textura; se desenlaza para
+    // que el siguiente fotograma en pantalla no herede el destino equivocado.
+    ID3D11RenderTargetView* none[1] = {nullptr};
+    device_->Context()->OMSetRenderTargets(1, none, nullptr);
+
+    return result;
 }
 
 void VideoRenderer::Destroy() noexcept {

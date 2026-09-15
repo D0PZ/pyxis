@@ -24,9 +24,14 @@
 #include <d2d1_1.h>
 #include <dwrite_1.h>
 
+#include <array>
 #include <string>
 
 namespace pyxis {
+
+// Velocidades de reproduccion disponibles, en milesimas. El orden es el del
+// ciclo al pulsar el indicador, y tambien el del menu contextual.
+inline constexpr std::array<int, 6> kPlaybackRates = {250, 500, 750, 1000, 1500, 2000};
 
 // Estado que la interfaz muestra. Se compara completo para decidir si hay que
 // repintar, de ahi el operador de igualdad.
@@ -50,6 +55,12 @@ struct OverlayModel {
     // Barra de control visible. Se oculta sola tras unos segundos sin actividad.
     bool showControls = true;
 
+    // Menu de velocidades desplegado (clic derecho sobre el indicador).
+    bool speedMenuOpen = false;
+
+    // Indice de kPlaybackRates bajo el puntero dentro del menu, o -1.
+    int speedMenuHighlight = -1;
+
     [[nodiscard]] bool operator==(const OverlayModel&) const = default;
 };
 
@@ -70,6 +81,14 @@ public:
     // Devuelve kNoTimestamp si el punto queda fuera de la barra.
     [[nodiscard]] Micros HitTestSeekBar(int x, int y) const noexcept;
 
+    // Controles a la derecha de la barra.
+    [[nodiscard]] bool HitTestSpeed(int x, int y) const noexcept;
+    [[nodiscard]] bool HitTestSnapshot(int x, int y) const noexcept;
+
+    // Indice dentro de kPlaybackRates del elemento del menu bajo el punto, o
+    // -1 si el menu esta cerrado o el punto cae fuera.
+    [[nodiscard]] int HitTestSpeedMenu(int x, int y) const noexcept;
+
     [[nodiscard]] bool ControlsVisible() const noexcept { return model_.showControls; }
 
 private:
@@ -79,6 +98,8 @@ private:
     void Repaint();
 
     void DrawControlBar(unsigned width, unsigned height);
+    void DrawSpeedControl(float right, float centerY);
+    void DrawSpeedMenu();
     void DrawStats(unsigned width);
     void DrawToast(unsigned width, unsigned height);
 
@@ -96,6 +117,7 @@ private:
     ComPtr<IDWriteTextFormat> timeFormat_;
     ComPtr<IDWriteTextFormat> titleFormat_;
     ComPtr<IDWriteTextFormat> statsFormat_;
+    ComPtr<IDWriteTextFormat> controlFormat_;   // indicadores de la derecha
 
     // Textura intermedia y su composicion
     ComPtr<ID3D11Texture2D>          surface_;
@@ -120,9 +142,12 @@ private:
     unsigned     height_ = 0;
     bool         dirty_  = true;
 
-    // Geometria de la barra de progreso del ultimo repintado, para el
-    // posicionamiento con el raton.
+    // Geometria del ultimo repintado, para el posicionamiento con el raton.
     D2D1_RECT_F seekBarRect_{};
+    D2D1_RECT_F speedRect_{};
+    D2D1_RECT_F snapshotRect_{};
+    D2D1_RECT_F speedMenuRect_{};
+    float       speedMenuItemHeight_ = 0.0f;
 };
 
 }  // namespace pyxis

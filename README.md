@@ -96,6 +96,7 @@ pyxis [opciones] [archivo o URL]
 | `X` | tamaño original (1:1) |
 | `[` `]` | velocidad de reproducción |
 | `Retroceso` | velocidad normal |
+| `S` | guardar el fotograma como PNG |
 | `I` | panel de estadísticas |
 | `O` | abrir archivo |
 | `Q` · `Esc` | salir |
@@ -116,6 +117,26 @@ con GOP largo (dos segundos es habitual en HEVC) el retroceso mantenido va más
 despacio. Pyxis espera a que cada paso aterrice antes de pedir el siguiente, de
 modo que el ritmo se ajusta solo a lo que la máquina aguanta en vez de acumular
 peticiones.
+
+### Velocidad y capturas
+
+A la derecha de la barra de progreso hay dos controles:
+
+**Indicador de velocidad.** Es texto, no un botón: un clic avanza por la lista
+`0.25x → 0.5x → 0.75x → 1x → 1.5x → 2x` y vuelve a empezar. Un **clic derecho**
+despliega la lista completa hacia arriba para saltar directamente de `0.25x` a
+`1.5x` sin recorrer el resto. Se pone azul cuando la reproducción no va a `1x`,
+para que se note de un vistazo. Las teclas `[` y `]` recorren esa misma lista.
+
+**Botón de captura.** Guarda el fotograma actual como PNG en
+`Imágenes\Pyxis`, con el nombre del medio y la posición exacta
+(`pelicula_01-23-45.678.png`).
+
+La captura **no es una copia de la ventana**. El fotograma se redibuja a su
+resolución nativa: con el vídeo 8K de prueba el PNG sale a 7680×4320 aunque la
+ventana midiera 1280×720, sin bandas negras, sin el zoom aplicado y sin la
+interfaz encima. Si el material es HDR se mapea a SDR, que es lo que un PNG
+puede representar. La codificación usa WIC, que ya viene con Windows.
 
 ### Zoom
 

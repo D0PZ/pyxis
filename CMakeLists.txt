@@ -96,6 +96,7 @@ set(PYXIS_SOURCES
     src/render/SwapChain.cpp
     src/render/VideoRenderer.cpp
     src/render/Overlay.cpp
+    src/render/Snapshot.cpp
 
     src/audio/WasapiRenderer.cpp
 
@@ -120,6 +121,7 @@ target_link_libraries(pyxis PRIVATE
     dxguid.lib
     d2d1.lib
     dwrite.lib
+    windowscodecs.lib   # WIC: codificacion PNG de las capturas
     avrt.lib        # MMCSS: prioridad de hilo multimedia
     winmm.lib
     ole32.lib

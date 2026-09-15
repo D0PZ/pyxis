@@ -205,6 +205,33 @@ El estado vive en `Controller::view_` bajo cerrojo (lo escribe la interfaz, lo
 lee la presentación en cada fotograma) y se publica con `SetViewTransform`
 justo antes de dibujar.
 
+## El bloqueo del avance manual
+
+Merece su propia sección porque no es evidente y se puede reintroducir.
+
+En pausa, el renderizador de audio no consume. Su cola se llena, el
+decodificador de audio se bloquea al empujar, la cola de paquetes de audio se
+llena también y el demultiplexor acaba dormido dentro de un `Push` de audio.
+Desde ese momento **deja de alimentar vídeo**. Con reproducción normal no se
+nota, porque el audio se consume; solo aparece al consumir vídeo sin consumir
+audio, que es exactamente lo que hace el avance fotograma a fotograma: se clava
+en cuanto agota lo precargado.
+
+La solución es `Player::steppingMode_`: mientras está activo, el demultiplexor
+descarta el audio en lugar de encolarlo. Al volver a reproducir se resincroniza
+con un salto al fotograma mostrado — que además es lo correcto, porque el audio
+encolado pertenecía a donde se pausó, no a donde se ha llegado pasando
+fotogramas.
+
+La segunda mitad del problema es la cadencia: una pulsación cuyo paso anterior
+no ha aterrizado **se descarta** (`if (stepPending_) return;`). Sin esa guarda,
+cada tecla reinicia la recogida y a 8K la secuencia no termina nunca.
+
+**Nada de aritmética con la duración del fotograma.** En material de tasa
+variable dos fotogramas consecutivos pueden distar 33 ms o 266 ms, así que
+«posición menos una duración» no identifica al anterior. Los límites se
+expresan como comparaciones: *el último que hay antes del actual*.
+
 ## Trampas conocidas
 
 - **`D3D11_BIND_SHADER_RESOURCE` en el pool de D3D11VA.** Se añade en
@@ -235,6 +262,29 @@ justo antes de dibujar.
 - **Orden de destrucción.** Los `VideoFrame` de la cola referencian texturas del
   pool del decodificador. Hay que soltarlos **antes** de cerrar el decodificador;
   ver `Player::Close`.
+
+- **`pendingFrame_`, el historial y `currentFrame_` pertenecen al hilo de
+  presentación.** Ningún otro hilo los toca. `Player::Close` y `OpenMedia` se
+  limitan a incrementar un contador (la generación y el número de medio) y ese
+  hilo los suelta en su siguiente pasada. Manipularlos desde la interfaz es una
+  carrera con el dibujado en curso.
+
+- **`IAudioClient::Reset` exige el flujo parado**, y el hilo de audio puede estar
+  dentro de `GetBuffer`. Por eso `WasapiRenderer::Flush` solo deja una petición
+  y el vaciado lo ejecuta el propio hilo de audio.
+
+- **Los paquetes se etiquetan con la generación que el demultiplexor tenía al
+  posicionarse**, no con la que haya al encolar. Leer el contador en el momento
+  de encolar hacía que un paquete anterior al salto viajara con la etiqueta
+  nueva: el decodificador se vaciaba y acto seguido lo decodificaba sin sus
+  fotogramas de referencia (`Could not find ref with POC`).
+
+- **Los saltos van sobre la pista de vídeo, no sobre la línea de tiempo global.**
+  Con `-1`, en un MP4 fragmentado se aterriza a mitad de grupo de imágenes.
+
+- **Arrastrar la barra genera más de cien mensajes por segundo.** Cada salto
+  vacía tres colas y reinicia el audio, así que se limitan (`RequestScrubSeek`)
+  y solo el de soltar está garantizado.
 
 ---
 
@@ -307,3 +357,8 @@ primera herramienta a mirar** ante cualquier problema de fluidez:
   (`ComputeFitRect`, `ApplyView`, `ClampPan`) precisamente para que la interfaz
   y el renderizador no puedan divergir. No la dupliques en `Controller`.
 - **Nueva métrica** → `PlayerStats` y `Controller::BuildStatsText`.
+- **Nuevo control en la barra** → dibujo en `Overlay::DrawControlBar` (o un
+  `Draw*` propio), prueba de impacto como `HitTestSpeed`, y reparto del clic en
+  `Controller::OnLeftButtonDown`. El orden de ese reparto importa: el menú
+  desplegado se queda con el clic antes que nadie, y la barra de progreso va la
+  última porque ocupa casi todo el ancho.

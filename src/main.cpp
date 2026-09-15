@@ -67,9 +67,14 @@ constexpr const wchar_t* kUsage =
     L"  X                    tamano original (1:1)\n"
     L"  [ / ]                velocidad de reproduccion\n"
     L"  Retroceso            velocidad normal\n"
+    L"  S                    guardar el fotograma como PNG\n"
     L"  I                    estadisticas\n"
     L"  O                    abrir archivo\n"
-    L"  Q / Esc              salir\n";
+    L"  Q / Esc              salir\n"
+    L"\n"
+    L"A la derecha de la barra de progreso hay un indicador de velocidad\n"
+    L"-clic para avanzar por la lista, clic derecho para elegir- y un boton\n"
+    L"de captura. Las capturas van a Imagenes\\Pyxis a resolucion nativa.\n";
 
 struct ParsedCommandLine {
     pyxis::Options options;

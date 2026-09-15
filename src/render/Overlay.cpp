@@ -21,6 +21,31 @@ constexpr float kMargin        = 24.0f;
 constexpr float kSeekBarHeight = 6.0f;
 constexpr float kSeekBarY      = 34.0f;   // desde el borde inferior
 
+// Controles a la derecha de la barra de progreso.
+constexpr float kSpeedWidth     = 52.0f;
+constexpr float kSnapshotWidth  = 34.0f;
+constexpr float kControlGap     = 10.0f;
+constexpr float kControlHeight  = 28.0f;
+constexpr float kControlsWidth  = kSpeedWidth + kControlGap + kSnapshotWidth;
+constexpr float kSpeedMenuItemH = 30.0f;
+
+// Texto de cada velocidad. Se construye una vez: formatearlo en cada repintado
+// seria reconstruir seis cadenas por nada.
+const std::array<std::wstring, kPlaybackRates.size()> kSpeedLabels = {
+    L"0.25x", L"0.5x", L"0.75x", L"1x", L"1.5x", L"2x",
+};
+
+[[nodiscard]] std::size_t IndexForRate(int rateMilli) noexcept {
+    for (std::size_t i = 0; i < kPlaybackRates.size(); ++i) {
+        if (kPlaybackRates[i] == rateMilli) return i;
+    }
+    return 3;   // 1x
+}
+
+[[nodiscard]] bool Contains(const D2D1_RECT_F& rect, float x, float y) noexcept {
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+
 // Blanco de la interfaz en HDR. BT.2408 fija el blanco de grafismos en 203
 // nits; subirlo hace que el texto deslumbre en escenas oscuras.
 constexpr float kUiWhiteNits = 203.0f;
@@ -160,6 +185,11 @@ void Overlay::CreateTextFormats() {
     createFormat(L"Segoe UI Variable Display", 17.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, titleFormat_);
     // Monoespaciada para las estadisticas: los numeros no bailan al cambiar.
     createFormat(L"Cascadia Mono", 13.0f, DWRITE_FONT_WEIGHT_NORMAL, statsFormat_);
+    createFormat(L"Segoe UI Variable Display", 14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                 controlFormat_);
+
+    controlFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    controlFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
     timeFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     titleFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
@@ -240,6 +270,10 @@ void Overlay::Repaint() {
     if (model_.showControls) {
         DrawControlBar(width_, height_);
     }
+    // El menu se dibuja despues de la barra para quedar por encima de ella.
+    if (model_.showControls && model_.speedMenuOpen) {
+        DrawSpeedMenu();
+    }
     if (model_.showStats) {
         DrawStats(width_);
     }
@@ -268,8 +302,9 @@ void Overlay::DrawControlBar(unsigned width, unsigned height) {
     d2dContext_->FillRectangle(D2D1::RectF(0, h - kBarHeight * 0.5f, w, h), brush_.Get());
 
     // --- Barra de progreso -------------------------------------------------
+    // Se acorta para dejar sitio a los indicadores de la derecha.
     const float barLeft  = kMargin;
-    const float barRight = w - kMargin;
+    const float barRight = w - kMargin - kControlsWidth - kControlGap;
     const float barY     = h - kSeekBarY;
 
     seekBarRect_ = D2D1::RectF(barLeft, barY - kSeekBarHeight * 0.5f,
@@ -298,20 +333,15 @@ void Overlay::DrawControlBar(unsigned width, unsigned height) {
             D2D1::Ellipse(D2D1::Point2F(filled.right, barY), 7.0f, 7.0f), brush_.Get());
     }
 
+    DrawSpeedControl(w - kMargin, barY);
+
     // --- Reloj -------------------------------------------------------------
     std::wstring clock = FormatTime(model_.position);
     if (model_.duration != kNoTimestamp) {
         clock += L"  /  " + FormatTime(model_.duration);
     }
-    if (model_.paused)          clock += L"   ‖ PAUSA";
-    if (model_.rateMilli != 1000) {
-        std::array<wchar_t, 32> speed{};
-        std::swprintf(speed.data(), speed.size(), L"   x%.2f", model_.rateMilli / 1000.0);
-        clock += speed.data();
-    }
-    if (model_.muted) {
-        clock += L"   \U0001F507";
-    }
+    if (model_.paused) clock += L"   PAUSA";
+    if (model_.muted)  clock += L"   SIN SONIDO";
 
     brush_->SetColor(Rgba(1, 1, 1, 0.92f));
     d2dContext_->DrawTextW(clock.c_str(), static_cast<UINT32>(clock.size()),
@@ -328,6 +358,92 @@ void Overlay::DrawControlBar(unsigned width, unsigned height) {
                                D2D1::RectF(kMargin, h - kBarHeight + 10.0f,
                                            w - kMargin, h - kSeekBarY - 12.0f),
                                brush_.Get());
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Indicadores de la derecha
+//
+//  La velocidad se dibuja como TEXTO, sin marco ni relleno: la intencion es que
+//  no parezca un boton. Solo se insinua con un fondo muy tenue cuando el menu
+//  esta abierto, para que se entienda de donde sale el desplegable.
+// ---------------------------------------------------------------------------
+void Overlay::DrawSpeedControl(float right, float centerY) {
+    const float snapshotLeft = right - kSnapshotWidth;
+    const float speedLeft    = snapshotLeft - kControlGap - kSpeedWidth;
+
+    speedRect_ = D2D1::RectF(speedLeft, centerY - kControlHeight * 0.5f,
+                             speedLeft + kSpeedWidth, centerY + kControlHeight * 0.5f);
+    snapshotRect_ = D2D1::RectF(snapshotLeft, centerY - kControlHeight * 0.5f,
+                                right, centerY + kControlHeight * 0.5f);
+
+    // --- Velocidad ---------------------------------------------------------
+    if (model_.speedMenuOpen) {
+        brush_->SetColor(Rgba(1, 1, 1, 0.12f));
+        d2dContext_->FillRoundedRectangle(D2D1::RoundedRect(speedRect_, 6.0f, 6.0f),
+                                          brush_.Get());
+    }
+
+    const std::wstring& label = kSpeedLabels[IndexForRate(model_.rateMilli)];
+
+    // Se resalta en azul cuando no esta a velocidad normal: asi se nota de un
+    // vistazo que la reproduccion va alterada, sin tener que leer el numero.
+    brush_->SetColor(model_.rateMilli == 1000 ? Rgba(1, 1, 1, 0.80f)
+                                              : Rgba(0.45f, 0.80f, 1.0f, 0.98f));
+    d2dContext_->DrawTextW(label.c_str(), static_cast<UINT32>(label.size()),
+                           controlFormat_.Get(), speedRect_, brush_.Get());
+
+    // --- Captura -----------------------------------------------------------
+    // Un circulo dentro de un anillo: la silueta de un obturador. Se dibuja con
+    // geometria y no con un emoji de camara porque asi se ve identico en
+    // cualquier equipo, tenga las fuentes que tenga.
+    const D2D1_POINT_2F center =
+        D2D1::Point2F((snapshotRect_.left + snapshotRect_.right) * 0.5f, centerY);
+
+    brush_->SetColor(Rgba(1, 1, 1, 0.80f));
+    d2dContext_->DrawEllipse(D2D1::Ellipse(center, 9.0f, 9.0f), brush_.Get(), 1.6f);
+    d2dContext_->FillEllipse(D2D1::Ellipse(center, 5.0f, 5.0f), brush_.Get());
+}
+
+void Overlay::DrawSpeedMenu() {
+    const auto count = static_cast<float>(kPlaybackRates.size());
+    const float menuHeight = count * kSpeedMenuItemH + 8.0f;
+    const float menuWidth  = kSpeedWidth + 26.0f;
+
+    // El menu crece HACIA ARRIBA desde el indicador: hacia abajo se saldria de
+    // la ventana, porque la barra ya esta pegada al borde inferior.
+    const float left = speedRect_.right - menuWidth;
+    const float top  = speedRect_.top - menuHeight - 8.0f;
+
+    speedMenuRect_       = D2D1::RectF(left, top, left + menuWidth, top + menuHeight);
+    speedMenuItemHeight_ = kSpeedMenuItemH;
+
+    brush_->SetColor(Rgba(0.05f, 0.07f, 0.10f, 0.94f));
+    d2dContext_->FillRoundedRectangle(D2D1::RoundedRect(speedMenuRect_, 8.0f, 8.0f),
+                                      brush_.Get());
+    brush_->SetColor(Rgba(1, 1, 1, 0.14f));
+    d2dContext_->DrawRoundedRectangle(D2D1::RoundedRect(speedMenuRect_, 8.0f, 8.0f),
+                                      brush_.Get(), 1.0f);
+
+    const std::size_t current = IndexForRate(model_.rateMilli);
+
+    for (std::size_t i = 0; i < kPlaybackRates.size(); ++i) {
+        const float itemTop = top + 4.0f + static_cast<float>(i) * kSpeedMenuItemH;
+        const D2D1_RECT_F item = D2D1::RectF(left + 4.0f, itemTop,
+                                             left + menuWidth - 4.0f,
+                                             itemTop + kSpeedMenuItemH);
+
+        if (static_cast<int>(i) == model_.speedMenuHighlight) {
+            brush_->SetColor(Rgba(1, 1, 1, 0.10f));
+            d2dContext_->FillRoundedRectangle(D2D1::RoundedRect(item, 5.0f, 5.0f),
+                                              brush_.Get());
+        }
+
+        brush_->SetColor(i == current ? Rgba(0.45f, 0.80f, 1.0f, 0.98f)
+                                      : Rgba(1, 1, 1, 0.82f));
+        d2dContext_->DrawTextW(kSpeedLabels[i].c_str(),
+                               static_cast<UINT32>(kSpeedLabels[i].size()),
+                               controlFormat_.Get(), item, brush_.Get());
     }
 }
 
@@ -445,6 +561,32 @@ void Overlay::Render(SwapChain& swapChain) {
     context->PSSetShaderResources(0, 1, none);
 }
 
+bool Overlay::HitTestSpeed(int x, int y) const noexcept {
+    if (!model_.showControls) return false;
+    return Contains(speedRect_, static_cast<float>(x), static_cast<float>(y));
+}
+
+bool Overlay::HitTestSnapshot(int x, int y) const noexcept {
+    if (!model_.showControls) return false;
+    return Contains(snapshotRect_, static_cast<float>(x), static_cast<float>(y));
+}
+
+int Overlay::HitTestSpeedMenu(int x, int y) const noexcept {
+    if (!model_.showControls || !model_.speedMenuOpen) return -1;
+    if (speedMenuItemHeight_ <= 0.0f) return -1;
+
+    const auto px = static_cast<float>(x);
+    const auto py = static_cast<float>(y);
+    if (!Contains(speedMenuRect_, px, py)) return -1;
+
+    const float offset = py - (speedMenuRect_.top + 4.0f);
+    if (offset < 0.0f) return -1;
+
+    const auto index = static_cast<int>(offset / speedMenuItemHeight_);
+    if (index < 0 || index >= static_cast<int>(kPlaybackRates.size())) return -1;
+    return index;
+}
+
 Micros Overlay::HitTestSeekBar(int x, int y) const noexcept {
     if (!model_.showControls) return kNoTimestamp;
     if (model_.duration == kNoTimestamp || model_.duration <= 0) return kNoTimestamp;
@@ -475,6 +617,7 @@ void Overlay::Destroy() noexcept {
     d2dDevice_.Reset();
     d2dFactory_.Reset();
 
+    controlFormat_.Reset();
     statsFormat_.Reset();
     titleFormat_.Reset();
     timeFormat_.Reset();

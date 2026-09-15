@@ -75,6 +75,15 @@ public:
     // antes del primer fotograma).
     void Clear(SwapChain& swapChain);
 
+    // Redibuja el fotograma a su RESOLUCION NATIVA en una textura propia y la
+    // devuelve. Lo usa la captura de pantalla.
+    //
+    // No sirve copiar el bufer trasero: eso daria el tamano de la ventana, con
+    // las bandas negras, el zoom aplicado y la interfaz encima. Aqui se dibuja
+    // limpio, sin encuadre y siempre en SDR, que es lo que espera un PNG.
+    [[nodiscard]] ComPtr<ID3D11Texture2D> RenderToTexture(const VideoFrame& frame,
+                                                          AVRational sampleAspect);
+
     void SetAdjustments(const ImageAdjustments& adjustments) noexcept {
         adjustments_ = adjustments;
     }
@@ -159,6 +168,24 @@ private:
             return hash;
         }
     };
+
+    // Vistas y geometria de un fotograma, listas para dibujar. Las comparten
+    // el dibujado en pantalla y la captura.
+    struct BoundFrame {
+        ID3D11ShaderResourceView* luma          = nullptr;
+        ID3D11ShaderResourceView* chroma        = nullptr;
+        unsigned                  textureWidth  = 0;
+        unsigned                  textureHeight = 0;
+        DXGI_FORMAT               lumaFormat    = DXGI_FORMAT_R8_UNORM;
+
+        [[nodiscard]] bool Valid() const noexcept {
+            return luma != nullptr && chroma != nullptr;
+        }
+    };
+
+    [[nodiscard]] BoundFrame BindFrame(const VideoFrame& frame);
+    void IssueDraw(ID3D11RenderTargetView* target, const D3D11_VIEWPORT& viewport,
+                   const BoundFrame& bound, const Constants& constants);
 
     void CreateShaders();
     void CreateSamplerAndBuffer();

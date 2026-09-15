@@ -90,12 +90,19 @@ private:
     [[nodiscard]] std::wstring BuildStatsText() const;
 
     // Entrada
+    // Controles a la derecha de la barra.
+    void CycleSpeed(int delta);
+    void ApplySpeedIndex(int index);
+    void RequestSnapshot();
+    void TakeSnapshot();   // hilo de presentacion
+
     void OnKeyDown(int virtualKey, bool shift, bool control, bool repeated);
     void OnKeyUp(int virtualKey);
     void OnFocusLost();
     void OnMouseMove(int x, int y);
     void OnLeftButtonDown(int x, int y);
     void OnLeftButtonUp(int x, int y);
+    void OnRightButtonDown(int x, int y);
     void OnWheel(int delta, int x, int y, bool control);
     void OnFilesDropped(const std::vector<std::wstring>& paths);
 
@@ -152,6 +159,15 @@ private:
     // puede digerir.
     std::atomic<Micros> scrubPosition_{kNoTimestamp};
     Micros              lastScrubSeekAt_ = 0;   // solo hilo de interfaz
+
+    // Menu de velocidades. Solo lo toca el hilo de interfaz salvo la bandera,
+    // que el de presentacion lee para dibujarlo.
+    std::atomic<bool> speedMenuOpen_{false};
+    std::atomic<int>  speedMenuHighlight_{-1};
+
+    // La captura la pide la interfaz y la ejecuta el hilo de presentacion, que
+    // es el unico dueno del fotograma y del renderizador.
+    std::atomic<bool> snapshotRequested_{false};
 
     // Encuadre. Lo escribe el hilo de interfaz y lo lee el de presentacion en
     // cada fotograma, de ahi el cerrojo. Es una estructura de doce bytes que se

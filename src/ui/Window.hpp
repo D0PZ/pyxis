@@ -47,6 +47,7 @@ public:
         std::function<void(int x, int y)> onMouseMove;
         std::function<void(int x, int y)> onLeftButtonDown;
         std::function<void(int x, int y)> onLeftButtonUp;
+        std::function<void(int x, int y)> onRightButtonDown;
         std::function<void()> onDoubleClick;
         std::function<void(int wheelDelta, int x, int y, bool control)> onWheel;
         std::function<void()> onClose;

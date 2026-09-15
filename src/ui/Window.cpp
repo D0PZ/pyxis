@@ -198,6 +198,13 @@ LRESULT Window::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_RBUTTONDOWN: {
+            if (callbacks_.onRightButtonDown) {
+                callbacks_.onRightButtonDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            }
+            return 0;
+        }
+
         case WM_LBUTTONDBLCLK: {
             if (callbacks_.onDoubleClick) callbacks_.onDoubleClick();
             return 0;

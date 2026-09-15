@@ -4,6 +4,7 @@
 #include "core/Log.hpp"
 #include "core/Text.hpp"
 #include "core/Thread.hpp"
+#include "render/Snapshot.hpp"
 
 #include <shobjidl.h>
 
@@ -103,6 +104,7 @@ int Controller::Run(const Options& options, int commandShow) {
         .onMouseMove      = [this](int x, int y) { OnMouseMove(x, y); },
         .onLeftButtonDown = [this](int x, int y) { OnLeftButtonDown(x, y); },
         .onLeftButtonUp   = [this](int x, int y) { OnLeftButtonUp(x, y); },
+        .onRightButtonDown = [this](int x, int y) { OnRightButtonDown(x, y); },
         .onDoubleClick    = [this] { window_.SetFullscreen(!window_.IsFullscreen()); },
         .onWheel          = [this](int delta, int x, int y, bool control) {
             OnWheel(delta, x, y, control);
@@ -213,6 +215,11 @@ void Controller::PresentationThread() {
     SetCurrentThreadName(L"pyxis-present");
     const MmcssScope mmcss(MmcssTask::Playback);
 
+    // WIC se instancia por CoCreateInstance al guardar una captura, y eso exige
+    // que el hilo tenga apartamento. MULTITHREADED para encajar con el resto
+    // del proceso.
+    const bool comInitialized = SUCCEEDED(::CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+
     while (presenting_.load(std::memory_order_acquire)) {
         try {
             PresentOneFrame();
@@ -235,6 +242,8 @@ void Controller::PresentationThread() {
             }
         }
     }
+
+    if (comInitialized) ::CoUninitialize();
 }
 
 void Controller::PresentOneFrame() {
@@ -268,6 +277,13 @@ void Controller::PresentOneFrame() {
         videoRenderer_.Draw(swapChain_, currentFrame_, player_.SampleAspectRatio());
     } else {
         videoRenderer_.Clear(swapChain_);
+    }
+
+    // La captura va DESPUES del dibujado y antes de presentar: asi el
+    // fotograma ya esta enlazado y las vistas en cache, y el usuario recibe
+    // exactamente lo que esta viendo.
+    if (snapshotRequested_.exchange(false, std::memory_order_acq_rel)) {
+        TakeSnapshot();
     }
 
     OverlayModel model;
@@ -476,11 +492,14 @@ void Controller::BuildOverlayModel(OverlayModel& model) {
     model.muted     = player_.Muted();
     model.volume    = player_.Volume();
     model.rateMilli = player_.RateMilli();
-    model.showStats = showStats_.load(std::memory_order_relaxed);
+    model.showStats          = showStats_.load(std::memory_order_relaxed);
+    model.speedMenuOpen      = speedMenuOpen_.load(std::memory_order_relaxed);
+    model.speedMenuHighlight = speedMenuHighlight_.load(std::memory_order_relaxed);
 
     // Los controles permanecen visibles si esta en pausa: ocultar la barra en
     // pausa obliga a mover el raton para saber donde se quedo la reproduccion.
-    model.showControls = model.paused || (now - lastActivity) < kControlsHideDelay;
+    model.showControls = model.paused || model.speedMenuOpen ||
+                         (now - lastActivity) < kControlsHideDelay;
 
     {
         std::lock_guard<std::mutex> lock(toastMutex_);
@@ -544,6 +563,68 @@ std::wstring Controller::BuildStatsText() const {
 // ---------------------------------------------------------------------------
 //  Entrada
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  Velocidad de reproduccion
+// ---------------------------------------------------------------------------
+void Controller::CycleSpeed(int delta) {
+    const int current = player_.RateMilli();
+
+    int index = 3;   // 1x si el valor actual no esta en la lista
+    for (std::size_t i = 0; i < kPlaybackRates.size(); ++i) {
+        if (kPlaybackRates[i] == current) {
+            index = static_cast<int>(i);
+            break;
+        }
+    }
+
+    // Aritmetica modular para que el ciclo de la vuelta en ambos sentidos.
+    const auto count = static_cast<int>(kPlaybackRates.size());
+    ApplySpeedIndex(((index + delta) % count + count) % count);
+}
+
+void Controller::ApplySpeedIndex(int index) {
+    if (index < 0 || index >= static_cast<int>(kPlaybackRates.size())) return;
+
+    player_.SetRateMilli(kPlaybackRates[static_cast<std::size_t>(index)]);
+    NoteUserActivity();
+}
+
+// ---------------------------------------------------------------------------
+//  Captura de fotograma
+// ---------------------------------------------------------------------------
+void Controller::RequestSnapshot() {
+    if (!player_.HasVideo()) return;
+    snapshotRequested_.store(true, std::memory_order_release);
+    NoteUserActivity();
+}
+
+void Controller::TakeSnapshot() {
+    if (!currentFrame_.IsValid()) {
+        ShowToast(L"No hay ningun fotograma que capturar");
+        return;
+    }
+
+    try {
+        const ComPtr<ID3D11Texture2D> texture =
+            videoRenderer_.RenderToTexture(currentFrame_, player_.SampleAspectRatio());
+        if (!texture) {
+            ShowToast(L"No se pudo preparar la captura");
+            return;
+        }
+
+        const std::wstring path =
+            BuildSnapshotPath(player_.Title(), currentFrame_.pts);
+        SaveTextureAsPng(device_, texture.Get(), path);
+
+        ShowToast(L"Captura guardada  " +
+                  std::filesystem::path(path).filename().wstring());
+
+    } catch (const Exception& error) {
+        PYXIS_ERROR("la captura fallo: {}", error.what());
+        ShowToast(L"No se pudo guardar la captura");
+    }
+}
+
 void Controller::NoteUserActivity() {
     lastActivity_.store(NowMicros(), std::memory_order_relaxed);
 }
@@ -622,7 +703,15 @@ void Controller::OnKeyDown(int virtualKey, bool shift, bool control, bool repeat
             break;
 
         case VK_ESCAPE:
+            if (speedMenuOpen_.load(std::memory_order_relaxed)) {
+                speedMenuOpen_.store(false, std::memory_order_relaxed);
+                break;
+            }
             if (window_.IsFullscreen()) window_.SetFullscreen(false);
+            break;
+
+        case 'S':
+            RequestSnapshot();
             break;
 
         case 'I':
@@ -642,21 +731,16 @@ void Controller::OnKeyDown(int virtualKey, bool shift, bool control, bool repeat
             ShowOpenDialog();
             break;
 
-        case VK_OEM_4: {   // [
-            const int rate = std::max(250, player_.RateMilli() - 250);
-            player_.SetRateMilli(rate);
-            ShowToast(L"Velocidad x" + std::to_wstring(rate / 1000.0).substr(0, 4));
+        // Recorren la MISMA lista que el indicador de la barra, para que
+        // teclado y raton no ofrezcan juegos de velocidades distintos.
+        case VK_OEM_4:   // [
+            CycleSpeed(-1);
             break;
-        }
-        case VK_OEM_6: {   // ]
-            const int rate = std::min(4000, player_.RateMilli() + 250);
-            player_.SetRateMilli(rate);
-            ShowToast(L"Velocidad x" + std::to_wstring(rate / 1000.0).substr(0, 4));
+        case VK_OEM_6:   // ]
+            CycleSpeed(+1);
             break;
-        }
         case VK_BACK:
             player_.SetRateMilli(1000);
-            ShowToast(L"Velocidad normal");
             break;
 
         case 'Q':
@@ -692,6 +776,12 @@ void Controller::OnFocusLost() {
 void Controller::OnMouseMove(int x, int y) {
     NoteUserActivity();
 
+    if (speedMenuOpen_.load(std::memory_order_relaxed)) {
+        speedMenuHighlight_.store(overlay_.HitTestSpeedMenu(x, y),
+                                  std::memory_order_relaxed);
+        return;
+    }
+
     // Arrastre de la barra de progreso: se busca en vivo para que el usuario
     // vea a donde va, en lugar de saltar solo al soltar.
     if (seeking_.load(std::memory_order_relaxed)) {
@@ -725,6 +815,24 @@ void Controller::OnMouseMove(int x, int y) {
 
 void Controller::OnLeftButtonDown(int x, int y) {
     NoteUserActivity();
+
+    // El menu de velocidades captura el clic antes que nada mas.
+    if (speedMenuOpen_.load(std::memory_order_relaxed)) {
+        const int index = overlay_.HitTestSpeedMenu(x, y);
+        speedMenuOpen_.store(false, std::memory_order_relaxed);
+        speedMenuHighlight_.store(-1, std::memory_order_relaxed);
+        if (index >= 0) ApplySpeedIndex(index);
+        return;   // un clic fuera del menu solo lo cierra
+    }
+
+    if (overlay_.HitTestSpeed(x, y)) {
+        CycleSpeed(+1);
+        return;
+    }
+    if (overlay_.HitTestSnapshot(x, y)) {
+        RequestSnapshot();
+        return;
+    }
 
     const Micros target = overlay_.HitTestSeekBar(x, y);
     if (target != kNoTimestamp) {
@@ -781,6 +889,22 @@ void Controller::RequestScrubSeek(Micros target, bool final) {
     player_.Seek(target);
 }
 
+void Controller::OnRightButtonDown(int x, int y) {
+    NoteUserActivity();
+
+    // El clic derecho sobre el indicador despliega la lista completa, que es lo
+    // que permite saltar de 0.25x a 1.5x sin recorrer el ciclo entero.
+    if (overlay_.HitTestSpeed(x, y)) {
+        const bool open = !speedMenuOpen_.load(std::memory_order_relaxed);
+        speedMenuOpen_.store(open, std::memory_order_relaxed);
+        speedMenuHighlight_.store(-1, std::memory_order_relaxed);
+        return;
+    }
+
+    speedMenuOpen_.store(false, std::memory_order_relaxed);
+    speedMenuHighlight_.store(-1, std::memory_order_relaxed);
+}
+
 void Controller::OnWheel(int delta, int x, int y, bool control) {
     NoteUserActivity();
 
@@ -813,6 +937,7 @@ void Controller::OpenMedia(const std::wstring& path) {
         mediaEpoch_.fetch_add(1, std::memory_order_acq_rel);
         scrubPosition_.store(kNoTimestamp, std::memory_order_relaxed);
         stepDirection_.store(0, std::memory_order_relaxed);
+        speedMenuOpen_.store(false, std::memory_order_relaxed);
 
         player_.Close();
         player_.Open(path);
