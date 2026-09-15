@@ -40,6 +40,7 @@
 #include "media/VideoDecoder.hpp"
 
 #include <atomic>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -115,11 +116,30 @@ public:
         return state_.load(std::memory_order_acquire);
     }
     [[nodiscard]] Micros Position() const noexcept;
-    [[nodiscard]] Micros Duration() const noexcept { return duration_; }
-    [[nodiscard]] bool   HasVideo() const noexcept { return hasVideo_; }
-    [[nodiscard]] bool   HasAudio() const noexcept { return hasAudio_; }
-    [[nodiscard]] const std::wstring& Title() const noexcept { return title_; }
-    [[nodiscard]] AVRational SampleAspectRatio() const noexcept { return sampleAspect_; }
+
+    // Los metadatos los escribe Open/Close desde el hilo de interfaz y los lee
+    // el de presentacion en cada fotograma, asi que van bajo cerrojo. Title()
+    // devuelve una COPIA: entregar una referencia a un std::wstring que otro
+    // hilo puede reasignar es una carrera de manual.
+    [[nodiscard]] Micros       Duration() const;
+    [[nodiscard]] std::wstring Title() const;
+    [[nodiscard]] AVRational   SampleAspectRatio() const;
+
+    // Estos dos se consultan en los bucles calientes de los hilos de
+    // decodificacion, de ahi que sean atomicos en lugar de ir con los demas.
+    [[nodiscard]] bool HasVideo() const noexcept {
+        return hasVideo_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool HasAudio() const noexcept {
+        return hasAudio_.load(std::memory_order_acquire);
+    }
+
+    // Cierto mientras el demultiplexor no ha atendido aun el ultimo salto. La
+    // interfaz lo usa para no encadenar saltos mas rapido de lo que el pipeline
+    // puede absorberlos al arrastrar la barra de progreso.
+    [[nodiscard]] bool SeekPending() const noexcept {
+        return seekPending_.load(std::memory_order_acquire);
+    }
 
     // Dimensiones codificadas del video. Solo cambian al abrir un medio, asi
     // que el hilo de interfaz puede leerlas para calcular el encuadre.
@@ -142,6 +162,16 @@ public:
     //  de trabajo. Por eso StepPending() existe: quien mantenga la tecla
     //  pulsada debe esperar a que el paso anterior aterrice en lugar de
     //  encolar peticiones que el decodificador no puede absorber.
+    //  Para que retroceder no se sienta, los fotogramas ya mostrados se
+    //  conservan en un HISTORIAL. No cuesta memoria de verdad: guardar un
+    //  fotograma es un av_frame_ref, que solo incrementa un contador; la
+    //  textura es la misma. Lo unico que hay que pagar son plazas extra en el
+    //  pool del decodificador, y por eso el tamano del historial se calcula a
+    //  partir de la resolucion (ver ComputeHistoryLimit).
+    //
+    //  Cuando el historial no alcanza, el salto recupera un LOTE completo en
+    //  una sola pasada en lugar de un unico fotograma: una busqueda cada N
+    //  pasos en vez de una por paso.
     void StepFrame(int direction);   // -1 atras, +1 adelante
 
     // Cierto mientras un paso solicitado aun no ha llegado a pantalla.
@@ -186,6 +216,19 @@ private:
     [[nodiscard]] FrameSelection SelectSteppedFrame(VideoFrame& out);
     void NoteDisplayedFrame(const VideoFrame& frame) noexcept;
 
+    // Historial. Todo esto pertenece en exclusiva al hilo de presentacion.
+    [[nodiscard]] static VideoFrame CloneFrameRef(const VideoFrame& source);
+    [[nodiscard]] static std::size_t ComputeHistoryLimit(int width, int height) noexcept;
+
+    void PushHistory(const VideoFrame& frame);
+    void ForgetHistory() noexcept;
+
+    // Intenta satisfacer el paso con lo que ya hay en memoria.
+    [[nodiscard]] bool ResolveStepFromHistory(int direction, VideoFrame& out);
+
+    // Prepara la recogida desde la cola cuando el historial no alcanza.
+    void PrepareStepCollection(int direction);
+
     // Un paquete etiquetado con la generacion en que se leyo.
     struct TaggedPacket {
         av::PacketPtr packet;
@@ -224,25 +267,72 @@ private:
     std::atomic<Micros>        seekTarget_{0};
     std::atomic<bool>          demuxFinished_{false};
 
+    // Modo de avance manual. Mientras esta activo, el demultiplexor DEJA DE
+    // encolar audio.
+    //
+    // No es un capricho: en pausa el renderizador de audio no consume, su cola
+    // se llena, el decodificador de audio se bloquea al empujar, la cola de
+    // paquetes de audio se llena tambien y el demultiplexor acaba dormido
+    // dentro de un Push de audio. A partir de ahi deja de alimentar video, y el
+    // avance fotograma a fotograma se clava en cuanto agota lo que hubiera
+    // precargado. Con la reproduccion normal el problema no existe porque el
+    // audio se consume; solo aparece al consumir video sin consumir audio.
+    //
+    // Al volver a reproducir se resincroniza con un salto a la posicion del
+    // fotograma mostrado, que es ademas lo correcto: el audio que estaba
+    // encolado pertenecia a donde se pauso, no a donde se ha llegado pasando
+    // fotogramas.
+    std::atomic<bool> steppingMode_{false};
+
     // Fotograma ya extraido de la cola pero cuyo momento aun no ha llegado.
     VideoFrame pendingFrame_;
 
     // Coordinacion del avance por fotogramas. `stepLowerBound_` es la marca de
     // tiempo minima que debe tener el fotograma buscado: los que lleguen antes
     // se descartan sin mostrarse.
-    std::atomic<bool>   stepPending_{false};
-    std::atomic<Micros> stepLowerBound_{0};
+    std::atomic<bool> stepPending_{false};
+
+    // Direccion de un paso aun sin resolver. La interfaz solo deja la peticion;
+    // quien decide si se sirve desde el historial o hace falta rebobinar es el
+    // hilo de presentacion, que es el dueno del historial.
+    std::atomic<int> stepRequest_{0};
+
+    // Recogida en curso (hilo de presentacion).
+    //
+    //  Los limites se expresan como COMPARACIONES con la marca de tiempo, no
+    //  como un objetivo calculado. La diferencia importa: en material de tasa
+    //  variable -grabaciones de movil, por ejemplo- dos fotogramas consecutivos
+    //  pueden estar a 33 ms o a 266 ms, asi que "posicion menos una duracion"
+    //  no identifica al fotograma anterior. Preguntar por "el ultimo que hay
+    //  antes del actual" si funciona siempre.
+    //
+    //      adelante : el primero con pts >= collectFrom_
+    //      atras    : el ultimo con pts < collectBefore_
+    Micros collectFrom_     = kNoTimestamp;
+    Micros collectBefore_   = kNoTimestamp;
+    bool   collectBackward_ = false;
+
+    std::deque<VideoFrame> history_;          // del mas antiguo al mas reciente
+    std::size_t            historyCursor_ = 0;
+    std::atomic<std::size_t> historyLimit_{0};
 
     // Estado del fotograma en pantalla. Lo escribe el hilo de presentacion y lo
     // lee el de interfaz para decidir a donde saltar en el siguiente paso.
     std::atomic<Micros> displayedPts_{kNoTimestamp};
     std::atomic<Micros> displayedDuration_{0};
 
+    mutable std::mutex metadataMutex_;
     Micros       duration_     = kNoTimestamp;
     AVRational   sampleAspect_ = AVRational{1, 1};
-    bool         hasVideo_     = false;
-    bool         hasAudio_     = false;
     std::wstring title_;
+
+    std::atomic<bool> hasVideo_{false};
+    std::atomic<bool> hasAudio_{false};
+
+    // Generacion que el hilo de presentacion vio la ultima vez. Solo la toca
+    // ese hilo, y es como descubre que el fotograma que tenia reservado ya no
+    // corresponde a la posicion actual.
+    std::uint32_t presenterGeneration_ = 0;
 
     // Metricas
     std::atomic<std::uint64_t> framesDecoded_{0};

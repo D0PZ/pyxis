@@ -73,6 +73,16 @@ public:
     [[nodiscard]] BoundedQueue<AudioBuffer>& Queue() noexcept { return queue_; }
 
     // Descarta lo que haya en vuelo tras un salto de posicion.
+    //
+    // Se puede llamar desde cualquier hilo: lo unico que hace es vaciar la cola
+    // (que tiene su propio cerrojo) y dejar una peticion. El trabajo de verdad
+    // -soltar el bufer a medias y reiniciar el flujo- lo hace el hilo de audio.
+    //
+    // Antes esto se hacia aqui mismo, y era un error de los que no perdonan:
+    // IAudioClient::Reset exige que el flujo este parado, y llamar a
+    // Stop/Reset/Start mientras el hilo de audio esta dentro de GetBuffer es
+    // una carrera con el controlador. Ademas pending_ y writePts_ son estado
+    // exclusivo de ese hilo.
     void Flush();
 
     void SetVolume(float volume) noexcept;
@@ -108,6 +118,9 @@ private:
 
     void PublishClock(MediaClock& clock);
 
+    // Atiende una peticion de vaciado. Solo se llama desde el hilo de audio.
+    void ApplyPendingFlush();
+
     template <typename T>
     using ComPtr = Microsoft::WRL::ComPtr<T>;
 
@@ -141,6 +154,7 @@ private:
     std::atomic<bool>          paused_{true};
     std::atomic<bool>          running_{false};
     std::atomic<bool>          deviceLost_{false};
+    std::atomic<bool>          flushRequested_{false};
     std::atomic<std::uint64_t> underruns_{0};
 };
 

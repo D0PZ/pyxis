@@ -21,6 +21,25 @@ constexpr Micros kFrameTolerance = 8000;   // 8 ms
 // estadisticas. Es diagnostico, no afecta a la reproduccion.
 constexpr Micros kLateThreshold = 40000;   // 40 ms
 
+// Presupuesto de memoria de video para el historial de fotogramas. Con la ruta
+// zero-copy, guardar un fotograma no copia pixeles pero si retiene una plaza
+// del pool de texturas, asi que el limite se reparte segun la resolucion: mucha
+// holgura en 1080p, la justa en 8K.
+// A 8K un fotograma ronda los 100 MiB, asi que el presupuesto decide cuantos
+// pasos atras son instantaneos: con 384 MiB salen 3 en 8K, el tope de 12 en 4K
+// y en 1080p. Subirlo mas tiene rendimientos decrecientes -entre salto y salto
+// hay que redecodificar el grupo de imagenes de todos modos- y penaliza a las
+// graficas modestas.
+constexpr std::size_t kHistoryBudgetBytes = 384u * 1024u * 1024u;
+constexpr std::size_t kHistoryMinFrames   = 3;
+constexpr std::size_t kHistoryMaxFrames   = 12;
+
+// Ventana minima que se rebobina al retroceder cuando el historial no alcanza.
+// Con tasa variable, la duracion del fotograma actual es mala estimacion de la
+// distancia al anterior, asi que se toma un suelo generoso: pasarse cuesta algo
+// de decodificacion, quedarse corto cuesta otro salto entero.
+constexpr Micros kMinRewindWindow = 400000;   // 400 ms
+
 }  // namespace
 
 Player::~Player() {
@@ -42,27 +61,39 @@ void Player::Open(const std::wstring& path) {
     try {
         demuxer_.Open(path);
 
-        duration_     = demuxer_.Duration();
-        sampleAspect_ = demuxer_.SampleAspectRatio();
-        hasVideo_     = demuxer_.Video().Valid();
-        hasAudio_     = demuxer_.Audio().Valid();
-        title_        = std::filesystem::path(path).filename().wstring();
+        {
+            std::lock_guard<std::mutex> lock(metadataMutex_);
+            duration_     = demuxer_.Duration();
+            sampleAspect_ = demuxer_.SampleAspectRatio();
+            title_        = std::filesystem::path(path).filename().wstring();
+        }
+        hasVideo_.store(demuxer_.Video().Valid(), std::memory_order_release);
+        hasAudio_.store(demuxer_.Audio().Valid(), std::memory_order_release);
 
-        if (hasVideo_) {
+        if (HasVideo()) {
+            const AVCodecParameters* params = demuxer_.Video().params;
+            const std::size_t historyLimit =
+                ComputeHistoryLimit(params->width, params->height);
+            historyLimit_.store(historyLimit, std::memory_order_release);
+
             VideoDecoder::Config config;
-            config.device          = device_;
-            config.context         = deviceContext_;
-            config.allowHardware   = device_ != nullptr;
-            // El pool debe cubrir la cola de fotogramas, el fotograma que el
-            // presentador esta mostrando y el que tiene reservado. Quedarse
-            // corto bloquea al decodificador en cada fotograma.
+            config.device        = device_;
+            config.context       = deviceContext_;
+            config.allowHardware = device_ != nullptr;
+
+            // El pool debe cubrir la cola de fotogramas, el historial, el
+            // fotograma que el presentador esta mostrando y el que tiene
+            // reservado. Quedarse corto bloquea al decodificador en cada
+            // fotograma.
             config.extraPoolFrames =
-                static_cast<int>(videoFrames_.Capacity()) + 4;
+                static_cast<int>(videoFrames_.Capacity() + historyLimit + 4);
 
             videoDecoder_.Open(demuxer_.Video(), config);
+
+            PYXIS_INFO("Historial de avance manual: {} fotogramas", historyLimit);
         }
 
-        if (hasAudio_) {
+        if (HasAudio()) {
             // El audio se abre ANTES que su decodificador: es el dispositivo
             // quien impone la frecuencia y el numero de canales, y el
             // decodificador debe remuestrear hacia ese formato.
@@ -77,13 +108,18 @@ void Player::Open(const std::wstring& path) {
                 // aqui degrada, no aborta.
                 PYXIS_WARN("el audio no esta disponible: {}", error.what());
                 audio_.Close();
-                hasAudio_ = false;
+                hasAudio_.store(false, std::memory_order_release);
             }
         }
 
-        PYXIS_REQUIRE(hasVideo_ || hasAudio_, "el archivo no tiene contenido reproducible");
+        PYXIS_REQUIRE(HasVideo() || HasAudio(),
+                      "el archivo no tiene contenido reproducible");
 
-        generation_.store(1, std::memory_order_release);
+        // La generacion NUNCA se reinicia. Si volviera a 1 en cada apertura, el
+        // hilo de presentacion podria encontrarse el mismo numero que tenia del
+        // medio anterior y conservar un fotograma que ya no existe.
+        generation_.fetch_add(1, std::memory_order_acq_rel);
+        steppingMode_.store(false, std::memory_order_release);
         seekPending_.store(false, std::memory_order_release);
         demuxFinished_.store(false, std::memory_order_release);
         clock_.Reset(0);
@@ -93,7 +129,7 @@ void Player::Open(const std::wstring& path) {
         state_.store(PlayerState::Paused, std::memory_order_release);
 
         PYXIS_INFO("Reproduciendo '{}' ({} video, {} audio)",
-                   ToUtf8(title_), hasVideo_ ? "con" : "sin", hasAudio_ ? "con" : "sin");
+                   ToUtf8(Title()), HasVideo() ? "con" : "sin", HasAudio() ? "con" : "sin");
 
     } catch (const Exception& error) {
         SetFailed(error.what());
@@ -111,8 +147,8 @@ void Player::StartThreads() {
     videoFrames_.Reopen();
 
     demuxThread_ = std::thread([this] { DemuxThread(); });
-    if (hasVideo_) videoThread_ = std::thread([this] { VideoDecodeThread(); });
-    if (hasAudio_) {
+    if (HasVideo()) videoThread_ = std::thread([this] { VideoDecodeThread(); });
+    if (HasAudio()) {
         audioThread_ = std::thread([this] { AudioDecodeThread(); });
         audio_.Start(clock_);
         audio_.SetPaused(true);
@@ -138,7 +174,11 @@ void Player::StopThreads() noexcept {
 void Player::Close() noexcept {
     StopThreads();
 
-    pendingFrame_ = VideoFrame{};
+    // pendingFrame_ pertenece al hilo de presentacion; tocarlo desde aqui seria
+    // una carrera. Se incrementa la generacion y ese hilo lo suelta el solo en
+    // su siguiente pasada. Mientras tanto el fotograma mantiene viva su textura
+    // por conteo de referencias, asi que cerrar el decodificador es seguro.
+    generation_.fetch_add(1, std::memory_order_acq_rel);
 
     // Orden importante: los fotogramas de la cola referencian texturas del pool
     // del decodificador, asi que hay que soltarlos ANTES de cerrarlo.
@@ -151,13 +191,22 @@ void Player::Close() noexcept {
     audio_.Close();
     demuxer_.Close();
 
-    duration_     = kNoTimestamp;
-    sampleAspect_ = AVRational{1, 1};
-    hasVideo_     = false;
-    hasAudio_     = false;
-    title_.clear();
+    {
+        std::lock_guard<std::mutex> lock(metadataMutex_);
+        duration_     = kNoTimestamp;
+        sampleAspect_ = AVRational{1, 1};
+        title_.clear();
+    }
+    hasVideo_.store(false, std::memory_order_release);
+    hasAudio_.store(false, std::memory_order_release);
 
+    steppingMode_.store(false, std::memory_order_release);
     stepPending_.store(false, std::memory_order_release);
+    stepRequest_.store(0, std::memory_order_release);
+    historyLimit_.store(0, std::memory_order_release);
+    collectFrom_     = kNoTimestamp;
+    collectBefore_   = kNoTimestamp;
+    collectBackward_ = false;
     displayedPts_.store(kNoTimestamp, std::memory_order_relaxed);
     displayedDuration_.store(0, std::memory_order_relaxed);
 
@@ -189,6 +238,17 @@ void Player::DemuxThread() {
 
     bool reachedEnd = false;
 
+    // Generacion que este hilo esta produciendo AHORA MISMO. Es local a
+    // proposito, y no una lectura de generation_ en cada paquete.
+    //
+    // Leerla al encolar era un error sutil: entre que se lee un paquete y se
+    // encola, otro hilo puede pedir un salto e incrementar el contador. Ese
+    // paquete -que pertenece a la posicion ANTERIOR- viajaria con la etiqueta
+    // NUEVA, el decodificador se vaciaria y acto seguido lo decodificaria sin
+    // sus fotogramas de referencia. En HEVC eso se manifiesta como "Could not
+    // find ref with POC" y deja al decodificador produciendo basura.
+    std::uint32_t demuxGeneration = generation_.load(std::memory_order_acquire);
+
     while (running_.load(std::memory_order_acquire)) {
         // --- Salto pendiente ------------------------------------------------
         if (seekPending_.exchange(false, std::memory_order_acq_rel)) {
@@ -196,6 +256,9 @@ void Player::DemuxThread() {
             demuxer_.Seek(target, true);
             reachedEnd = false;
             demuxFinished_.store(false, std::memory_order_release);
+
+            // A partir de aqui los paquetes pertenecen a la posicion nueva.
+            demuxGeneration = generation_.load(std::memory_order_acquire);
         }
 
         if (reachedEnd) {
@@ -214,15 +277,15 @@ void Player::DemuxThread() {
             reachedEnd = true;
             // Sentinela de fin: hace que los decodificadores se vacien y
             // entreguen los fotogramas que retienen por reordenamiento B.
-            if (hasVideo_) {
+            if (HasVideo()) {
                 TaggedPacket sentinel;
-                sentinel.generation = generation_.load(std::memory_order_acquire);
+                sentinel.generation = demuxGeneration;
                 sentinel.endOfFile  = true;
                 (void)videoPackets_.Push(std::move(sentinel));
             }
-            if (hasAudio_) {
+            if (HasAudio() && !steppingMode_.load(std::memory_order_acquire)) {
                 TaggedPacket sentinel;
-                sentinel.generation = generation_.load(std::memory_order_acquire);
+                sentinel.generation = demuxGeneration;
                 sentinel.endOfFile  = true;
                 (void)audioPackets_.Push(std::move(sentinel));
             }
@@ -243,13 +306,26 @@ void Player::DemuxThread() {
         const int index = packet->stream_index;
         BoundedQueue<TaggedPacket>* target = nullptr;
 
-        if (hasVideo_ && index == demuxer_.Video().index)      target = &videoPackets_;
-        else if (hasAudio_ && index == demuxer_.Audio().index) target = &audioPackets_;
-        else continue;   // pista descartada
+        if (HasVideo() && index == demuxer_.Video().index) {
+            target = &videoPackets_;
+        } else if (HasAudio() && index == demuxer_.Audio().index) {
+            // En modo paso el audio se descarta. Ver la nota de steppingMode_
+            // en Player.hpp: encolarlo bloquearia este hilo y con el moriria la
+            // alimentacion de video, que es justo lo unico que el avance manual
+            // necesita.
+            if (steppingMode_.load(std::memory_order_acquire)) continue;
+            target = &audioPackets_;
+        } else {
+            continue;   // pista descartada
+        }
+
+        // Si mientras se leia se pidio un salto, este paquete pertenece a la
+        // posicion anterior y ya no sirve para nada.
+        if (seekPending_.load(std::memory_order_acquire)) continue;
 
         TaggedPacket item;
         item.packet     = av::MakePacket();
-        item.generation = generation_.load(std::memory_order_acquire);
+        item.generation = demuxGeneration;
         ::av_packet_move_ref(item.packet.get(), packet.get());
 
         // Push bloquea cuando la cola esta llena: esa es la contrapresion que
@@ -303,6 +379,7 @@ void Player::VideoDecodeThread() {
             if (received == VideoDecoder::Status::Error) break;
 
             framesDecoded_.fetch_add(1, std::memory_order_relaxed);
+            frame.generation = currentGeneration;
 
             // Un fotograma de una generacion anterior se descarta sin llegar a
             // la cola: mostrarlo produciria un parpadeo tras el salto.
@@ -360,7 +437,18 @@ void Player::AudioDecodeThread() {
 //  Seleccion del fotograma a presentar
 // ---------------------------------------------------------------------------
 Player::FrameSelection Player::SelectFrame(VideoFrame& out) {
-    if (!hasVideo_) return FrameSelection::None;
+    // La generacion es tambien como este hilo se entera de que el fotograma que
+    // tenia reservado pertenece a otra posicion, o a otro medio. Se comprueba
+    // ANTES que nada para que cerrar un archivo libere la reserva aunque ya no
+    // quede pista de video.
+    const std::uint32_t generation = generation_.load(std::memory_order_acquire);
+    if (generation != presenterGeneration_) {
+        presenterGeneration_ = generation;
+        pendingFrame_ = VideoFrame{};
+        ForgetHistory();   // pertenece a la posicion anterior
+    }
+
+    if (!HasVideo()) return FrameSelection::None;
 
     // El avance manual manda sobre el reloj: mientras hay un paso pendiente se
     // busca un fotograma concreto, no el que toque por tiempo.
@@ -374,6 +462,12 @@ Player::FrameSelection Player::SelectFrame(VideoFrame& out) {
     for (;;) {
         if (!pendingFrame_.IsValid()) {
             if (!videoFrames_.TryPop(pendingFrame_)) break;
+        }
+
+        // Rezagado de antes del ultimo salto: fuera.
+        if (pendingFrame_.generation != presenterGeneration_) {
+            pendingFrame_ = VideoFrame{};
+            continue;
         }
 
         // Un fotograma sin marca de tiempo se muestra de inmediato: es lo unico
@@ -412,7 +506,7 @@ Player::FrameSelection Player::SelectFrame(VideoFrame& out) {
     }
 
     // Sin pista de audio no hay quien ancle el reloj, asi que lo hace el video.
-    if (!hasAudio_ && out.pts != kNoTimestamp &&
+    if (!HasAudio() && out.pts != kNoTimestamp &&
         state_.load(std::memory_order_acquire) == PlayerState::Playing) {
         // Solo se reancla si la deriva es grande; hacerlo en cada fotograma
         // convertiria el reloj en una escalera con la cadencia del video.
@@ -422,6 +516,10 @@ Player::FrameSelection Player::SelectFrame(VideoFrame& out) {
     }
 
     NoteDisplayedFrame(out);
+
+    // Todo lo que se muestra entra en el historial, de modo que pausar y
+    // retroceder funcione al instante sin haber tenido que anticiparlo.
+    PushHistory(out);
 
     // Tasa real de presentacion, en ventanas de un segundo.
     const Micros nowReal = NowMicros();
@@ -440,6 +538,135 @@ Player::FrameSelection Player::SelectFrame(VideoFrame& out) {
     return FrameSelection::Updated;
 }
 
+std::size_t Player::ComputeHistoryLimit(int width, int height) noexcept {
+    if (width <= 0 || height <= 0) return kHistoryMinFrames;
+
+    // Tres bytes por pixel es el peor caso (P010: luma de 16 bits mas croma
+    // submuestreado). Pasarse por arriba es preferible a quedarse corto y
+    // agotar la memoria de video en material UHD.
+    const std::size_t bytesPerFrame =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3u;
+
+    const std::size_t affordable = kHistoryBudgetBytes / std::max<std::size_t>(bytesPerFrame, 1);
+    return std::clamp(affordable, kHistoryMinFrames, kHistoryMaxFrames);
+}
+
+VideoFrame Player::CloneFrameRef(const VideoFrame& source) {
+    VideoFrame copy;
+    if (!source.IsValid()) return copy;
+
+    copy.frame = av::MakeFrame();
+
+    // av_frame_ref NO copia pixeles: incrementa el contador de los buferes. En
+    // la ruta por hardware eso significa que el historial no cuesta ni una
+    // transferencia, solo una plaza mas en el pool de texturas.
+    if (::av_frame_ref(copy.frame.get(), source.frame.get()) < 0) {
+        copy.frame.reset();
+        return copy;
+    }
+
+    copy.pts        = source.pts;
+    copy.duration   = source.duration;
+    copy.color      = source.color;
+    copy.width      = source.width;
+    copy.height     = source.height;
+    copy.texture    = source.texture;
+    copy.arraySlice = source.arraySlice;
+    copy.generation = source.generation;
+    return copy;
+}
+
+void Player::PushHistory(const VideoFrame& frame) {
+    const std::size_t limit = historyLimit_.load(std::memory_order_relaxed);
+    if (limit == 0) return;
+
+    VideoFrame copy = CloneFrameRef(frame);
+    if (!copy.IsValid()) return;
+
+    history_.push_back(std::move(copy));
+    while (history_.size() > limit) history_.pop_front();
+    historyCursor_ = history_.size() - 1;
+}
+
+void Player::ForgetHistory() noexcept {
+    history_.clear();
+    historyCursor_ = 0;
+}
+
+bool Player::ResolveStepFromHistory(int direction, VideoFrame& out) {
+    if (history_.empty()) return false;
+
+    if (direction < 0) {
+        if (historyCursor_ == 0) return false;
+        --historyCursor_;
+    } else {
+        if (historyCursor_ + 1 >= history_.size()) return false;
+        ++historyCursor_;
+    }
+
+    out = CloneFrameRef(history_[historyCursor_]);
+    if (!out.IsValid()) return false;
+
+    if (out.pts != kNoTimestamp) clock_.Reset(out.pts);
+    NoteDisplayedFrame(out);
+
+    PYXIS_DEBUG("Paso {} -> {} ms (historial {}/{})", direction > 0 ? "+1" : "-1",
+                out.pts / 1000, historyCursor_ + 1, history_.size());
+    return true;
+}
+
+void Player::PrepareStepCollection(int direction) {
+    // Duracion de referencia del paso. Se prefiere la del fotograma en pantalla
+    // (correcta con tasa variable) y se cae a la nominal del flujo.
+    Micros step = displayedDuration_.load(std::memory_order_relaxed);
+    if (step <= 0) step = videoDecoder_.NominalFrameDuration();
+    if (step <= 0) step = kMicrosPerSecond / 25;   // ultimo recurso
+
+    Micros position = displayedPts_.load(std::memory_order_relaxed);
+    if (position == kNoTimestamp) position = clock_.Position();
+
+    if (direction > 0) {
+        // Adelante: el siguiente fotograma ya esta en la cola o en camino, y es
+        // simplemente el primero que venga DESPUES del actual. Nada de calcular
+        // "posicion mas una duracion": con tasa variable eso se saltaria los
+        // fotogramas que llegan antes de lo nominal.
+        collectFrom_     = position + 1;
+        collectBefore_   = kNoTimestamp;
+        collectBackward_ = false;
+        return;
+    }
+
+    // Atras y sin historial util: toca rebobinar. Se aprovecha el viaje para
+    // repoblar el historial entero, de modo que los siguientes pasos hacia
+    // atras salgan de memoria.
+    //
+    //      salto        conservar desde aqui        limite (el actual)
+    //        |                   |                         |
+    //        v                   v                         v
+    //   ... [K] . . . . . . . [P-n] ... [P-2] [P-1] [P (en pantalla)]
+    //                                          ^
+    //                                   este es el que se muestra:
+    //                                   el ultimo anterior al limite
+    const auto batch = static_cast<Micros>(
+        std::max<std::size_t>(historyLimit_.load(std::memory_order_relaxed), 1));
+
+    Micros window = step * batch;
+    if (window < kMinRewindWindow) window = kMinRewindWindow;
+
+    ForgetHistory();
+
+    collectFrom_     = position - window > 0 ? position - window : 0;
+    collectBefore_   = position;
+    collectBackward_ = true;
+
+    RequestSeekInternal(collectFrom_);
+
+    // La generacion acaba de cambiar por el salto. Se adopta aqui mismo para
+    // que la comprobacion de SelectFrame no vuelva a vaciar el historial que
+    // estamos a punto de repoblar.
+    presenterGeneration_ = generation_.load(std::memory_order_acquire);
+}
+
 void Player::NoteDisplayedFrame(const VideoFrame& frame) noexcept {
     if (frame.pts != kNoTimestamp) {
         displayedPts_.store(frame.pts, std::memory_order_relaxed);
@@ -453,8 +680,19 @@ void Player::NoteDisplayedFrame(const VideoFrame& frame) noexcept {
 //  Avance fotograma a fotograma
 // ---------------------------------------------------------------------------
 Player::FrameSelection Player::SelectSteppedFrame(VideoFrame& out) {
-    const Micros lowerBound = stepLowerBound_.load(std::memory_order_acquire);
+    // 1. Peticion nueva: primero se intenta servir de memoria. Este es el
+    //    camino habitual al revisar un plano adelante y atras, y es inmediato.
+    const int request = stepRequest_.exchange(0, std::memory_order_acq_rel);
+    if (request != 0) {
+        if (ResolveStepFromHistory(request, out)) {
+            stepPending_.store(false, std::memory_order_release);
+            return FrameSelection::Updated;
+        }
+        PrepareStepCollection(request);
+    }
 
+    // 2. El historial no alcanzaba: hay que recoger de la cola. Puede requerir
+    //    varias presentaciones mientras el decodificador trabaja.
     for (;;) {
         if (!pendingFrame_.IsValid()) {
             if (!videoFrames_.TryPop(pendingFrame_)) {
@@ -465,12 +703,72 @@ Player::FrameSelection Player::SelectSteppedFrame(VideoFrame& out) {
             }
         }
 
-        // Los fotogramas anteriores al objetivo son el precio de rebobinar
-        // hasta el fotograma clave: se descartan sin llegar a mostrarse.
-        if (pendingFrame_.pts != kNoTimestamp && pendingFrame_.pts < lowerBound) {
+        // Rezagado de antes del salto. Descartarlo aqui es lo que evita el
+        // reintento espurio: sin esta comprobacion, un fotograma viejo con marca
+        // de tiempo posterior al limite hace creer a la recogida que ya llego al
+        // final, y se lanza un segundo salto innecesario.
+        if (pendingFrame_.generation != presenterGeneration_) {
             pendingFrame_ = VideoFrame{};
             continue;
         }
+
+        const Micros pts = pendingFrame_.pts;
+
+        if (collectBackward_) {
+            // Hemos alcanzado el fotograma actual: el que buscabamos es el
+            // ultimo que entro en el historial. pendingFrame_ NO se consume, se
+            // deja en su sitio como siguiente de la secuencia.
+            if (pts != kNoTimestamp && pts >= collectBefore_) {
+                if (history_.empty()) {
+                    // El salto no llego lo bastante atras (fotograma clave muy
+                    // cercano, o tasa variable con un hueco enorme). Se amplia
+                    // la ventana y se reintenta.
+                    if (collectFrom_ <= 0) {
+                        // Ya estabamos en el principio del archivo: no hay
+                        // fotograma anterior que mostrar.
+                        stepPending_.store(false, std::memory_order_release);
+                        return FrameSelection::None;
+                    }
+
+                    const Micros widened = (collectBefore_ - collectFrom_) * 2;
+                    collectFrom_ = collectBefore_ - widened > 0
+                                       ? collectBefore_ - widened
+                                       : 0;
+                    pendingFrame_ = VideoFrame{};
+                    RequestSeekInternal(collectFrom_);
+                    presenterGeneration_ = generation_.load(std::memory_order_acquire);
+                    return FrameSelection::None;
+                }
+
+                historyCursor_ = history_.size() - 1;
+                out = CloneFrameRef(history_[historyCursor_]);
+                if (!out.IsValid()) return FrameSelection::None;
+
+                clock_.Reset(out.pts);
+                NoteDisplayedFrame(out);
+                stepPending_.store(false, std::memory_order_release);
+
+                PYXIS_DEBUG("Paso -1 -> {} ms (rebobinado, historial {}/{})",
+                            out.pts / 1000, historyCursor_ + 1, history_.size());
+                return FrameSelection::Updated;
+            }
+
+            // Anterior al actual: se guarda en el historial y se sigue. Esto es
+            // lo que convierte un salto en varios pasos atras gratis.
+            if (pts == kNoTimestamp || pts >= collectFrom_) {
+                PushHistory(pendingFrame_);
+            }
+            pendingFrame_ = VideoFrame{};
+            continue;
+        }
+
+        // Adelante: lo anterior al corte se descarta sin mostrarse.
+        if (pts != kNoTimestamp && collectFrom_ != kNoTimestamp && pts < collectFrom_) {
+            pendingFrame_ = VideoFrame{};
+            continue;
+        }
+
+        PushHistory(pendingFrame_);
 
         out = std::move(pendingFrame_);
         pendingFrame_ = VideoFrame{};
@@ -483,49 +781,50 @@ Player::FrameSelection Player::SelectSteppedFrame(VideoFrame& out) {
 
         NoteDisplayedFrame(out);
         stepPending_.store(false, std::memory_order_release);
+
+        PYXIS_DEBUG("Paso +1 -> {} ms (decodificado, historial {}/{})",
+                    out.pts / 1000, historyCursor_ + 1, history_.size());
         return FrameSelection::Updated;
     }
 }
 
 void Player::StepFrame(int direction) {
-    if (!hasVideo_ || direction == 0) return;
+    if (!HasVideo() || direction == 0) return;
 
     const PlayerState current = state_.load(std::memory_order_acquire);
     if (current == PlayerState::Idle || current == PlayerState::Failed) return;
+
+    // Si el paso anterior aun no ha aterrizado, este se descarta.
+    //
+    // Es LA condicion que evita que el avance se quede clavado. Retroceder
+    // exige rebobinar al fotograma clave y redecodificar hacia delante, y a 8K
+    // eso tarda mas que el intervalo entre pulsaciones. Sin esta guarda, cada
+    // tecla reinicia la recogida desde cero -vaciando el historial que se
+    // estaba repoblando- y la secuencia no llega nunca al final: el reproductor
+    // encadena saltos al mismo punto sin mostrar un solo fotograma.
+    //
+    // Descartar la pulsacion es lo correcto: el paso en vuelo ya va en esa
+    // direccion, y quien mantenga la tecla recibira el siguiente en cuanto
+    // este aterrice.
+    if (stepPending_.load(std::memory_order_acquire)) return;
 
     // Avanzar de uno en uno implica pausa: no tiene sentido pedir un fotograma
     // concreto mientras el reloj sigue corriendo por debajo.
     Pause();
 
-    // Duracion de referencia del paso. Se prefiere la del fotograma en pantalla
-    // (correcta con tasa variable) y se cae a la nominal del flujo.
-    Micros step = displayedDuration_.load(std::memory_order_relaxed);
-    if (step <= 0) step = videoDecoder_.NominalFrameDuration();
-    if (step <= 0) step = kMicrosPerSecond / 25;   // ultimo recurso
-
-    Micros position = displayedPts_.load(std::memory_order_relaxed);
-    if (position == kNoTimestamp) position = clock_.Position();
-
-    if (direction > 0) {
-        // Adelante: el siguiente fotograma ya esta en la cola o en camino. El
-        // umbral a media duracion descarta el actual sin descartar el siguiente.
-        stepLowerBound_.store(position + step / 2, std::memory_order_release);
-        stepPending_.store(true, std::memory_order_release);
-        return;
+    // Al entrar en modo paso se sueltan las colas de audio. El demultiplexor
+    // dejara de alimentarlas (ver steppingMode_), asi que dejarlas llenas solo
+    // retendria memoria y mantendria bloqueado al decodificador de audio.
+    if (!steppingMode_.exchange(true, std::memory_order_acq_rel)) {
+        audioPackets_.Flush();
+        audio_.Flush();
     }
 
-    // Atras: hay que rebobinar y redecodificar. El umbral se situa a una
-    // duracion y media, que es el unico punto que deja fuera al ante-anterior
-    // y dentro al anterior:
-    //
-    //      ... P-2        P-1        P (en pantalla)
-    //           |    umbral |         |
-    //           |<-- 1.5 duraciones ->|
-    const Micros target = position - step;
-    stepLowerBound_.store(position - step - step / 2, std::memory_order_release);
+    // Aqui solo se deja la peticion. Decidir si se sirve del historial o si hay
+    // que rebobinar le corresponde al hilo de presentacion, que es el dueno del
+    // historial; resolverlo desde este hilo seria una carrera con el dibujado.
+    stepRequest_.store(direction, std::memory_order_release);
     stepPending_.store(true, std::memory_order_release);
-
-    RequestSeekInternal(target > 0 ? target : 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +843,15 @@ void Player::Play() {
     // Un paso a medias dejaria el reloj clavado esperando un fotograma que
     // ya no interesa.
     stepPending_.store(false, std::memory_order_release);
+
+    // Salir del modo paso exige resincronizar: el audio dejo de leerse donde se
+    // pauso, y a estas alturas el video puede estar segundos por delante. Un
+    // salto a la posicion del fotograma en pantalla deja las dos pistas
+    // alineadas y es el unico punto de partida que el usuario espera.
+    if (steppingMode_.exchange(false, std::memory_order_acq_rel)) {
+        const Micros shown = displayedPts_.load(std::memory_order_relaxed);
+        if (shown != kNoTimestamp) RequestSeekInternal(shown);
+    }
 
     clock_.SetPaused(false);
     audio_.SetPaused(false);
@@ -567,14 +875,17 @@ void Player::Seek(Micros target) {
     const PlayerState current = state_.load(std::memory_order_acquire);
     if (current == PlayerState::Idle || current == PlayerState::Failed) return;
 
-    if (duration_ != kNoTimestamp) {
-        target = std::clamp<Micros>(target, 0, duration_);
+    const Micros total = Duration();
+    if (total != kNoTimestamp) {
+        target = std::clamp<Micros>(target, 0, total);
     } else if (target < 0) {
         target = 0;
     }
 
-    // Un salto normal invalida cualquier paso en curso.
+    // Un salto normal invalida cualquier paso en curso y saca del modo paso:
+    // a partir de aqui el audio vuelve a alimentarse con normalidad.
     stepPending_.store(false, std::memory_order_release);
+    steppingMode_.store(false, std::memory_order_release);
     RequestSeekInternal(target);
 }
 
@@ -594,7 +905,8 @@ void Player::RequestSeekInternal(Micros target) {
     audioPackets_.Flush();
     videoFrames_.Flush();
 
-    pendingFrame_ = VideoFrame{};
+    // pendingFrame_ no se toca aqui: pertenece al hilo de presentacion, que lo
+    // suelta solo al ver la generacion nueva (ver SelectFrame).
 
     // 3. Peticion al demultiplexor, que es el unico dueno del contenedor.
     seekTarget_.store(target, std::memory_order_release);
@@ -629,8 +941,25 @@ void Player::SetRateMilli(int rateMilli) {
 Micros Player::Position() const noexcept {
     const Micros position = clock_.Position();
     if (position < 0) return 0;
-    if (duration_ != kNoTimestamp && position > duration_) return duration_;
+
+    const Micros total = Duration();
+    if (total != kNoTimestamp && position > total) return total;
     return position;
+}
+
+Micros Player::Duration() const {
+    std::lock_guard<std::mutex> lock(metadataMutex_);
+    return duration_;
+}
+
+std::wstring Player::Title() const {
+    std::lock_guard<std::mutex> lock(metadataMutex_);
+    return title_;
+}
+
+AVRational Player::SampleAspectRatio() const {
+    std::lock_guard<std::mutex> lock(metadataMutex_);
+    return sampleAspect_;
 }
 
 void Player::SetFailed(const std::string& message) {

@@ -132,15 +132,28 @@ void Demuxer::Seek(Micros target, bool backward) {
 
     if (target < 0) target = 0;
 
-    // Se busca sobre la base de tiempo global (AV_TIME_BASE) y se deja que
-    // FFmpeg elija el indice adecuado; hacerlo por pista falla en
-    // contenedores donde la pista de video no tiene indice propio.
-    const std::int64_t timestamp =
-        ::av_rescale_q(target, AVRational{1, static_cast<int>(kMicrosPerSecond)},
-                       AVRational{1, AV_TIME_BASE});
+    // Se salta sobre la pista de VIDEO cuando existe, no sobre la linea de
+    // tiempo global.
+    //
+    // La diferencia es real: con el indice global (-1) FFmpeg elige la pista
+    // por su cuenta y en un MP4 fragmentado puede aterrizar a mitad de un grupo
+    // de imagenes. El decodificador arranca entonces sin sus fotogramas de
+    // referencia y escupe "Could not find ref with POC" hasta encontrar el
+    // siguiente fotograma clave. Indicando la pista de video, FFmpeg usa su
+    // indice de claves y cae en una de verdad.
+    int          streamIndex = -1;
+    std::int64_t timestamp   = 0;
+
+    if (video_.Valid()) {
+        streamIndex = video_.index;
+        timestamp   = av::FromMicros(target, video_.timeBase);
+    } else {
+        timestamp = ::av_rescale_q(target, AVRational{1, static_cast<int>(kMicrosPerSecond)},
+                                   AVRational{1, AV_TIME_BASE});
+    }
 
     const int flags = backward ? AVSEEK_FLAG_BACKWARD : 0;
-    const int rc = ::av_seek_frame(format_.get(), -1, timestamp, flags);
+    const int rc = ::av_seek_frame(format_.get(), streamIndex, timestamp, flags);
 
     if (rc < 0) {
         // Un salto fallido no debe tumbar la reproduccion: el contenedor

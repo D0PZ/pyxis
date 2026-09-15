@@ -178,6 +178,12 @@ void WasapiRenderer::RenderThread(MediaClock& clock) {
         const DWORD waited = ::WaitForMultipleObjects(2, waitHandles, FALSE, 2000);
 
         if (waited == WAIT_OBJECT_0) break;          // parada solicitada
+
+        if (flushRequested_.exchange(false, std::memory_order_acq_rel)) {
+            ApplyPendingFlush();
+            continue;
+        }
+
         if (waited == WAIT_TIMEOUT) {
             // El dispositivo dejo de pedir datos. Casi siempre significa que
             // desaparecio; se confirma en la siguiente llamada.
@@ -334,18 +340,27 @@ void WasapiRenderer::SetPaused(bool paused) {
 }
 
 void WasapiRenderer::Flush() {
+    // La cola se puede vaciar desde cualquier hilo; tiene su propio cerrojo.
     queue_.Flush();
+
+    // El resto queda pendiente para el hilo de audio, que es el dueno tanto del
+    // bufer a medias como del IAudioClient. Lo atendera en su siguiente
+    // despertar, es decir en el proximo periodo del dispositivo (unos 10 ms).
+    flushRequested_.store(true, std::memory_order_release);
+}
+
+void WasapiRenderer::ApplyPendingFlush() {
     pending_       = AudioBuffer{};
     pendingOffset_ = 0;
     writePts_      = kNoTimestamp;
 
-    // Reiniciar el flujo descarta lo que el dispositivo tenga en su bufer. Sin
-    // esto, tras un salto se oiria un fragmento de la posicion anterior.
-    if (client_) {
-        client_->Stop();
-        client_->Reset();
-        client_->Start();
-    }
+    // Reiniciar el flujo descarta lo que el dispositivo tenga ya en su bufer.
+    // Sin esto, tras un salto se oiria un fragmento de la posicion anterior.
+    // El orden es obligatorio: Reset falla con AUDCLNT_E_NOT_STOPPED si el
+    // flujo sigue en marcha.
+    client_->Stop();
+    client_->Reset();
+    client_->Start();
 }
 
 void WasapiRenderer::SetVolume(float volume) noexcept {
@@ -373,10 +388,11 @@ void WasapiRenderer::Close() noexcept {
         stopEvent_ = nullptr;
     }
 
-    pending_       = AudioBuffer{};
-    pendingOffset_ = 0;
-    writePts_      = kNoTimestamp;
-    bufferFrames_  = 0;
+    pending_        = AudioBuffer{};
+    pendingOffset_  = 0;
+    writePts_       = kNoTimestamp;
+    bufferFrames_   = 0;
+    flushRequested_.store(false, std::memory_order_release);
 }
 
 }  // namespace pyxis

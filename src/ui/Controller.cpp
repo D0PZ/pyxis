@@ -44,6 +44,15 @@ constexpr float kZoomMax  = 32.0f;
 // Distancia a partir de la cual un clic pasa a considerarse arrastre.
 constexpr int kDragThreshold = 4;
 
+// Intervalo minimo entre saltos al arrastrar la barra de progreso. El raton
+// genera mas de cien mensajes por segundo y cada salto vacia las tres colas,
+// reinicia el flujo de audio e invalida todo lo decodificado: emitirlos sin
+// limite deja la imagen congelada mientras se arrastra.
+constexpr Micros kScrubMinInterval = 80000;   // 80 ms
+
+// Cada cuanto se refrescan las capacidades del monitor.
+constexpr Micros kDisplayQueryInterval = 500000;   // 500 ms
+
 std::uint64_t PackSize(unsigned width, unsigned height) noexcept {
     return (static_cast<std::uint64_t>(width) << 32) | height;
 }
@@ -234,6 +243,17 @@ void Controller::PresentOneFrame() {
     // el reloj se lee en el ultimo momento posible.
     swapChain_.WaitForNextFrame();
 
+    // Cambio de medio. Se atiende aqui, en el hilo dueno de estos recursos: las
+    // texturas del pool anterior desaparecen y las vistas cacheadas quedarian
+    // apuntando a memoria que el controlador grafico puede reutilizar para el
+    // pool nuevo.
+    const std::uint32_t epoch = mediaEpoch_.load(std::memory_order_acquire);
+    if (epoch != presentedEpoch_) {
+        presentedEpoch_ = epoch;
+        currentFrame_   = VideoFrame{};
+        videoRenderer_.InvalidateViewCache();
+    }
+
     ApplyPendingResize();
     UpdateFrameStepping();
 
@@ -404,12 +424,24 @@ void Controller::ResetView() {
 }
 
 void Controller::UpdateHdrMode(const VideoFrame& frame) {
+    const bool contentIsHdr = frame.color.IsHdr();
+    const Micros now = NowMicros();
+
+    // La consulta al monitor se refresca solo cuando cambia la naturaleza del
+    // contenido o cada medio segundo, por si la ventana se arrastro a otra
+    // pantalla. Hacerla por fotograma cuesta un recorrido de las salidas de
+    // DXGI sesenta veces por segundo.
+    if (contentIsHdr != lastContentHdr_ ||
+        now - displayQueriedAt_ >= kDisplayQueryInterval) {
+        lastContentHdr_   = contentIsHdr;
+        displayQueriedAt_ = now;
+        cachedDisplay_    = swapChain_.QueryDisplayCapabilities();
+    }
+
     // El HDR se activa solo cuando AMBAS condiciones se cumplen. Forzarlo con
     // contenido SDR lo deja apagado y grisaceo; forzarlo en una pantalla sin
     // HDR lo deja directamente ilegible.
-    const bool contentIsHdr = frame.color.IsHdr();
-    const DisplayCapabilities display = swapChain_.QueryDisplayCapabilities();
-    const bool wanted = contentIsHdr && display.supportsHdr10;
+    const bool wanted = contentIsHdr && cachedDisplay_.supportsHdr10;
 
     if (wanted != swapChain_.IsHdrOutput()) {
         swapChain_.SetHdrOutput(wanted);
@@ -424,9 +456,22 @@ void Controller::BuildOverlayModel(OverlayModel& model) {
     const Micros now = NowMicros();
     const Micros lastActivity = lastActivity_.load(std::memory_order_relaxed);
 
-    model.title     = player_.Title();
-    model.position  = player_.Position();
-    model.duration  = player_.Duration();
+    model.title    = player_.Title();
+    model.duration = player_.Duration();
+
+    // Mientras se arrastra la barra manda el raton, no el reloj: asi el cabezal
+    // no da tirones entre un salto y el siguiente.
+    const Micros scrub = scrubPosition_.load(std::memory_order_relaxed);
+    const Micros position = scrub != kNoTimestamp ? scrub : player_.Position();
+
+    // La posicion se REDONDEA a decimas de segundo, y no por pereza: el modelo
+    // se compara entero para decidir si hay que repintar la superposicion, y en
+    // microsegundos cambia siempre, con lo que Direct2D rasterizaria los glifos
+    // sesenta veces por segundo sobre una textura del tamano de la ventana. A
+    // 4K eso es trabajo suficiente para provocar microcortes. Con decimas, el
+    // reloj sigue exacto al segundo y el cabezal se mueve 0,03 px por paso en
+    // una pelicula de dos horas.
+    model.position = (position / 100000) * 100000;
     model.paused    = player_.State() != PlayerState::Playing;
     model.muted     = player_.Muted();
     model.volume    = player_.Volume();
@@ -457,7 +502,7 @@ void Controller::BuildOverlayModel(OverlayModel& model) {
 
 std::wstring Controller::BuildStatsText() const {
     const PlayerStats stats = player_.Stats();
-    const DisplayCapabilities display = swapChain_.QueryDisplayCapabilities();
+    const DisplayCapabilities& display = cachedDisplay_;
 
     std::array<wchar_t, 1024> buffer{};
     std::swprintf(
@@ -651,7 +696,7 @@ void Controller::OnMouseMove(int x, int y) {
     // vea a donde va, en lugar de saltar solo al soltar.
     if (seeking_.load(std::memory_order_relaxed)) {
         const Micros target = overlay_.HitTestSeekBar(x, y);
-        if (target != kNoTimestamp) player_.Seek(target);
+        if (target != kNoTimestamp) RequestScrubSeek(target, false);
         return;
     }
 
@@ -684,7 +729,7 @@ void Controller::OnLeftButtonDown(int x, int y) {
     const Micros target = overlay_.HitTestSeekBar(x, y);
     if (target != kNoTimestamp) {
         seeking_.store(true, std::memory_order_relaxed);
-        player_.Seek(target);
+        RequestScrubSeek(target, false);
         return;
     }
 
@@ -698,13 +743,42 @@ void Controller::OnLeftButtonDown(int x, int y) {
 }
 
 void Controller::OnLeftButtonUp(int, int) {
-    seeking_.store(false, std::memory_order_relaxed);
+    if (seeking_.exchange(false, std::memory_order_relaxed)) {
+        // Al soltar SIEMPRE se emite el salto definitivo, aunque el limitador
+        // de cadencia acabase de descartar uno: si no, la reproduccion se
+        // quedaria donde cayo el ultimo salto permitido y no donde el usuario
+        // dejo el cabezal.
+        const Micros target = scrubPosition_.load(std::memory_order_relaxed);
+        if (target != kNoTimestamp) RequestScrubSeek(target, true);
+        scrubPosition_.store(kNoTimestamp, std::memory_order_relaxed);
+        return;
+    }
 
     const bool wasClick = leftButtonDown_ && !dragMoved_;
     leftButtonDown_ = false;
     dragMoved_      = false;
 
     if (wasClick) player_.TogglePause();
+}
+
+void Controller::RequestScrubSeek(Micros target, bool final) {
+    // La posicion del cabezal se publica siempre, para que la barra siga al
+    // raton con fluidez independientemente de cuando se emita el salto.
+    scrubPosition_.store(final ? kNoTimestamp : target, std::memory_order_relaxed);
+
+    const Micros now = NowMicros();
+
+    // Dos condiciones para emitir: que el salto anterior ya lo haya recogido el
+    // demultiplexor y que haya pasado el intervalo minimo. La primera adapta la
+    // cadencia a la maquina y al archivo; la segunda evita castigar al pipeline
+    // en ficheros locales donde los saltos se atienden en un instante.
+    if (!final) {
+        if (player_.SeekPending()) return;
+        if (now - lastScrubSeekAt_ < kScrubMinInterval) return;
+    }
+
+    lastScrubSeekAt_ = now;
+    player_.Seek(target);
 }
 
 void Controller::OnWheel(int delta, int x, int y, bool control) {
@@ -732,10 +806,15 @@ void Controller::OnFilesDropped(const std::vector<std::wstring>& paths) {
 // ---------------------------------------------------------------------------
 void Controller::OpenMedia(const std::wstring& path) {
     try {
-        player_.Close();
-        currentFrame_ = VideoFrame{};
-        videoRenderer_.InvalidateViewCache();
+        // El fotograma en pantalla y la cache de vistas pertenecen al hilo de
+        // presentacion. Se le avisa con el numero de medio y el los suelta en
+        // su siguiente pasada; tocarlos desde aqui seria una carrera con el
+        // dibujado en curso.
+        mediaEpoch_.fetch_add(1, std::memory_order_acq_rel);
+        scrubPosition_.store(kNoTimestamp, std::memory_order_relaxed);
+        stepDirection_.store(0, std::memory_order_relaxed);
 
+        player_.Close();
         player_.Open(path);
         currentPath_ = path;
         ResetView();   // el encuadre del archivo anterior no aplica a este

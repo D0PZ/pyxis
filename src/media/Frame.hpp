@@ -84,6 +84,13 @@ struct VideoFrame {
     int  width  = 0;   // dimensiones visibles, ya recortadas
     int  height = 0;
 
+    // Generacion de reproduccion en la que se decodifico. Un fotograma que
+    // sobreviva a un salto -porque ya estaba en vuelo cuando se pidio- llega
+    // con la etiqueta vieja y se descarta sin mostrarse. Sin este sello, ese
+    // rezagado se confunde con material valido y hace que el avance manual
+    // crea que ya alcanzo su objetivo.
+    std::uint32_t generation = 0;
+
     // Ruta por hardware: la textura pertenece al pool de FFmpeg y es un ARRAY.
     // `arraySlice` indica que capa de ese array contiene este fotograma.
     ID3D11Texture2D* texture    = nullptr;

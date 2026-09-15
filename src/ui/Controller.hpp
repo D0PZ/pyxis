@@ -78,6 +78,10 @@ private:
     [[nodiscard]] ViewTransform CurrentView() const;
     [[nodiscard]] RECT          CurrentFitRect() const;
 
+    // Emite el salto de un arrastre de la barra de progreso, limitando la
+    // cadencia. Ver la nota de implementacion.
+    void RequestScrubSeek(Micros target, bool final);
+
     void ZoomAt(int x, int y, float factor);
     void ApplyFitView();
     void ApplyOriginalSizeView();
@@ -117,6 +121,20 @@ private:
     // Fotograma en pantalla. Solo lo toca el hilo de presentacion.
     VideoFrame currentFrame_;
 
+    // Numero de medio. Lo incrementa el hilo de interfaz al abrir un archivo y
+    // el de presentacion lo compara con el suyo para saber que debe soltar el
+    // fotograma y la cache de vistas. Hacerlo asi -y no llamando a
+    // InvalidateViewCache desde la interfaz- evita manipular estado del
+    // renderizador mientras el otro hilo esta dibujando con el.
+    std::atomic<std::uint32_t> mediaEpoch_{0};
+    std::uint32_t              presentedEpoch_ = 0;
+
+    // Capacidades del monitor, cacheadas. GetContainingOutput enumera salidas y
+    // no es barata; consultarla por fotograma se nota como microcortes.
+    DisplayCapabilities cachedDisplay_{};
+    Micros              displayQueriedAt_ = 0;
+    bool                lastContentHdr_   = false;
+
     Options options_{};
 
     // Estado de la interfaz, compartido entre ambos hilos.
@@ -127,6 +145,13 @@ private:
     // Avance fotograma a fotograma mientras se mantiene una flecha.
     std::atomic<int>    stepDirection_{0};   // -1, 0, +1
     std::atomic<Micros> nextStepAt_{0};
+
+    // Arrastre de la barra de progreso. `scrubPosition_` es donde esta el raton
+    // AHORA, que no es lo mismo que el ultimo salto emitido: la barra sigue al
+    // cursor sin fisuras mientras los saltos se limitan a lo que el pipeline
+    // puede digerir.
+    std::atomic<Micros> scrubPosition_{kNoTimestamp};
+    Micros              lastScrubSeekAt_ = 0;   // solo hilo de interfaz
 
     // Encuadre. Lo escribe el hilo de interfaz y lo lee el de presentacion en
     // cada fotograma, de ahi el cerrojo. Es una estructura de doce bytes que se
