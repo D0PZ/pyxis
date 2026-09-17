@@ -7,9 +7,21 @@
 *.sh text eol=lf
 
 # Binarios: que git no toque un solo byte.
+#
+# Importa mas de lo que parece. Con `* text=auto`, git inspecciona el contenido
+# de cada archivo para decidir si convertirle los finales de linea; sobre un
+# video de varios gigabytes eso son minutos de CPU antes siquiera de fallar.
+# Declararlos binarios corta esa inspeccion de raiz.
 *.ico binary
 *.png binary
 *.jpg binary
 *.exe binary
 *.lib binary
 *.pdb binary
+*.mp4 binary
+*.mkv binary
+*.mov binary
+*.avi binary
+*.webm binary
+*.ts binary
+*.m2ts binary

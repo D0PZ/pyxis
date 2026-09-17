@@ -430,7 +430,7 @@ void Controller::ApplyOriginalSizeView() {
                                 clientHeight_.load(std::memory_order_relaxed), view_);
     }
 
-    ShowToast(L"Tamano original  " + std::to_wstring(player_.VideoWidth()) + L" x " +
+    ShowToast(L"Tamaño original  " + std::to_wstring(player_.VideoWidth()) + L" x " +
               std::to_wstring(player_.VideoHeight()));
 }
 
@@ -492,14 +492,18 @@ void Controller::BuildOverlayModel(OverlayModel& model) {
     model.muted     = player_.Muted();
     model.volume    = player_.Volume();
     model.rateMilli = player_.RateMilli();
-    model.showStats          = showStats_.load(std::memory_order_relaxed);
+    // Sin medio abierto manda la bienvenida: la barra de control no tiene nada
+    // que controlar y una ventana negra no explica nada.
+    model.showWelcome = player_.State() == PlayerState::Idle;
+    model.showStats   = showStats_.load(std::memory_order_relaxed) && !model.showWelcome;
     model.speedMenuOpen      = speedMenuOpen_.load(std::memory_order_relaxed);
     model.speedMenuHighlight = speedMenuHighlight_.load(std::memory_order_relaxed);
 
     // Los controles permanecen visibles si esta en pausa: ocultar la barra en
     // pausa obliga a mover el raton para saber donde se quedo la reproduccion.
-    model.showControls = model.paused || model.speedMenuOpen ||
-                         (now - lastActivity) < kControlsHideDelay;
+    model.showControls = !model.showWelcome &&
+                         (model.paused || model.speedMenuOpen ||
+                          (now - lastActivity) < kControlsHideDelay);
 
     {
         std::lock_guard<std::mutex> lock(toastMutex_);
@@ -528,13 +532,13 @@ std::wstring Controller::BuildStatsText() const {
         buffer.data(), buffer.size(),
         L"Contenedor   %hs\n"
         L"Decodificador %hs (%s)\n"
-        L"Resolucion   %d x %d\n"
-        L"Duracion     %s\n"
+        L"Resolución   %d x %d\n"
+        L"Duración     %s\n"
         L"\n"
-        L"Presentacion %.1f fps\n"
+        L"Presentación %.1f fps\n"
         L"Decodificados %llu\n"
         L"Descartados  %llu\n"
-        L"Tardios      %llu\n"
+        L"Tardíos      %llu\n"
         L"Cortes audio %llu\n"
         L"\n"
         L"Colas        v-pkt %zu  a-pkt %zu  v-frm %zu\n"
@@ -600,7 +604,7 @@ void Controller::RequestSnapshot() {
 
 void Controller::TakeSnapshot() {
     if (!currentFrame_.IsValid()) {
-        ShowToast(L"No hay ningun fotograma que capturar");
+        ShowToast(L"No hay ningún fotograma que capturar");
         return;
     }
 
@@ -816,6 +820,14 @@ void Controller::OnMouseMove(int x, int y) {
 void Controller::OnLeftButtonDown(int x, int y) {
     NoteUserActivity();
 
+    // Sin medio abierto, cualquier punto de la ventana abre el dialogo: obligar
+    // a acertar en un boton pequeno seria justo el problema que la pantalla de
+    // bienvenida viene a resolver.
+    if (overlay_.WelcomeVisible()) {
+        ShowOpenDialog();
+        return;
+    }
+
     // El menu de velocidades captura el clic antes que nada mas.
     if (speedMenuOpen_.load(std::memory_order_relaxed)) {
         const int index = overlay_.HitTestSpeedMenu(x, y);
@@ -823,6 +835,19 @@ void Controller::OnLeftButtonDown(int x, int y) {
         speedMenuHighlight_.store(-1, std::memory_order_relaxed);
         if (index >= 0) ApplySpeedIndex(index);
         return;   // un clic fuera del menu solo lo cierra
+    }
+
+    if (overlay_.HitTestPlayPause(x, y)) {
+        player_.TogglePause();
+        return;
+    }
+    if (overlay_.HitTestStepBack(x, y)) {
+        player_.StepFrame(-1);
+        return;
+    }
+    if (overlay_.HitTestStepForward(x, y)) {
+        player_.StepFrame(+1);
+        return;
     }
 
     if (overlay_.HitTestSpeed(x, y)) {
@@ -972,7 +997,7 @@ void Controller::ShowOpenDialog() {
         if (SUCCEEDED(::CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                          IID_PPV_ARGS(&dialog)))) {
             static const COMDLG_FILTERSPEC filters[] = {
-                {L"Archivos de video",
+                {L"Archivos de vídeo",
                  L"*.mp4;*.mkv;*.mov;*.avi;*.webm;*.m2ts;*.ts;*.mpg;*.mpeg;*.wmv;*.flv;*.m4v"},
                 {L"Archivos de audio", L"*.mp3;*.flac;*.aac;*.m4a;*.opus;*.ogg;*.wav;*.wma"},
                 {L"Todos los archivos", L"*.*"},

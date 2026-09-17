@@ -77,6 +77,16 @@ pyxis [opciones] [archivo o URL]
 | `--log ARCHIVO` | duplicar el registro en un archivo |
 | `-h`, `--help` | ayuda |
 
+### Al abrir la aplicación
+
+Sin ningún archivo cargado aparece una pantalla que dice qué hacer: arrastra un
+vídeo sobre la ventana, o haz clic en cualquier punto para abrir el diálogo. Ahí
+mismo se listan los atajos principales.
+
+Con un vídeo abierto, la barra inferior trae los controles visibles —reproducir,
+un fotograma atrás, un fotograma adelante— a la izquierda, y el indicador de
+velocidad con el botón de captura a la derecha.
+
 ### Controles
 
 | Tecla | Acción |

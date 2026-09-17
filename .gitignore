@@ -26,3 +26,20 @@ CMakeUserPresets.json
 # Local
 *.log
 /scratch/
+
+# Material de prueba. Un repositorio de reproductor de video atrae archivos
+# pesados por naturaleza, y `git add -A` no distingue: basta con dejar caer una
+# carpeta de peliculas al lado del codigo para intentar subir decenas de GB.
+/.hidden/
+/media/
+/samples/
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.m2ts
+*.ts
+*.m4v
+*.wmv
+*.flv

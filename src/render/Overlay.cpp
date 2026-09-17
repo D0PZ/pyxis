@@ -16,17 +16,27 @@ namespace pyxis {
 namespace {
 
 // Metricas de la interfaz, en pixeles logicos.
-constexpr float kBarHeight     = 92.0f;
+//
+//  La barra se organiza en tres filas, como la de cualquier reproductor de
+//  escritorio: titulo arriba, barra de progreso a lo ancho, y debajo los
+//  botones con el reloj. Tener los controles en su propia fila -y no montados
+//  sobre la barra de progreso- es lo que permite que la barra ocupe todo el
+//  ancho y que los botones tengan una zona de clic comoda.
+constexpr float kBarHeight     = 108.0f;
 constexpr float kMargin        = 24.0f;
 constexpr float kSeekBarHeight = 6.0f;
-constexpr float kSeekBarY      = 34.0f;   // desde el borde inferior
+constexpr float kSeekBarY      = 58.0f;   // desde el borde inferior
+constexpr float kButtonRowY    = 26.0f;   // centro de la fila de botones
 
-// Controles a la derecha de la barra de progreso.
+// Botones de transporte.
+constexpr float kButtonSize = 30.0f;
+constexpr float kButtonGap  = 6.0f;
+
+// Controles a la derecha.
 constexpr float kSpeedWidth     = 52.0f;
 constexpr float kSnapshotWidth  = 34.0f;
 constexpr float kControlGap     = 10.0f;
 constexpr float kControlHeight  = 28.0f;
-constexpr float kControlsWidth  = kSpeedWidth + kControlGap + kSnapshotWidth;
 constexpr float kSpeedMenuItemH = 30.0f;
 
 // Texto de cada velocidad. Se construye una vez: formatearlo en cada repintado
@@ -44,6 +54,37 @@ const std::array<std::wstring, kPlaybackRates.size()> kSpeedLabels = {
 
 [[nodiscard]] bool Contains(const D2D1_RECT_F& rect, float x, float y) noexcept {
     return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+
+// Los iconos se dibujan con geometria y no con caracteres de una fuente: asi
+// se ven identicos en cualquier equipo, tenga instaladas las fuentes que tenga,
+// y escalan sin depender de que exista el glifo en el tamano adecuado.
+void FillTriangle(ID2D1DeviceContext* context, ID2D1Geometry* triangle,
+                  ID2D1Brush* brush, D2D1_POINT_2F center, float scale,
+                  bool pointsRight) {
+    const D2D1::Matrix3x2F flip =
+        D2D1::Matrix3x2F::Scale(pointsRight ? scale : -scale, scale);
+    context->SetTransform(flip * D2D1::Matrix3x2F::Translation(center.x, center.y));
+    context->FillGeometry(triangle, brush);
+    context->SetTransform(D2D1::Matrix3x2F::Identity());
+}
+
+void FillPauseBars(ID2D1DeviceContext* context, ID2D1Brush* brush,
+                   D2D1_POINT_2F center) {
+    constexpr float kBarW = 3.6f;
+    constexpr float kBarH = 8.0f;
+    constexpr float kSeparation = 3.2f;
+
+    context->FillRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(center.x - kSeparation - kBarW, center.y - kBarH,
+                                      center.x - kSeparation, center.y + kBarH),
+                          1.4f, 1.4f),
+        brush);
+    context->FillRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(center.x + kSeparation, center.y - kBarH,
+                                      center.x + kSeparation + kBarW, center.y + kBarH),
+                          1.4f, 1.4f),
+        brush);
 }
 
 // Blanco de la interfaz en HDR. BT.2408 fija el blanco de grafismos en 203
@@ -154,6 +195,27 @@ void Overlay::CreateDeviceResources() {
     PYXIS_CHECK_HR(d3d->CreateRasterizerState(&rasterizerDesc, &rasterizer_),
                    "no se pudo crear el rasterizador de la superposicion");
 
+    // Triangulo de reproduccion centrado en el origen y apuntando a la derecha.
+    // Se reutiliza para play, los botones de paso y el icono de bienvenida.
+    PYXIS_CHECK_HR(d2dFactory_->CreatePathGeometry(&triangleGeometry_),
+                   "no se pudo crear la geometria del triangulo");
+    {
+        ComPtr<ID2D1GeometrySink> sink;
+        PYXIS_CHECK_HR(triangleGeometry_->Open(&sink),
+                       "no se pudo abrir la geometria del triangulo");
+        sink->BeginFigure(D2D1::Point2F(-6.0f, -8.0f), D2D1_FIGURE_BEGIN_FILLED);
+        sink->AddLine(D2D1::Point2F(8.0f, 0.0f));
+        sink->AddLine(D2D1::Point2F(-6.0f, 8.0f));
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        PYXIS_CHECK_HR(sink->Close(), "no se pudo cerrar la geometria del triangulo");
+    }
+
+    const D2D1_STROKE_STYLE_PROPERTIES dashed = D2D1::StrokeStyleProperties(
+        D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+        D2D1_LINE_JOIN_ROUND, 10.0f, D2D1_DASH_STYLE_DASH, 0.0f);
+    PYXIS_CHECK_HR(d2dFactory_->CreateStrokeStyle(dashed, nullptr, 0, &dashedStroke_),
+                   "no se pudo crear el trazo discontinuo");
+
     D3D11_BUFFER_DESC bufferDesc{};
     bufferDesc.ByteWidth      = sizeof(Constants);
     bufferDesc.Usage          = D3D11_USAGE_DYNAMIC;
@@ -188,8 +250,24 @@ void Overlay::CreateTextFormats() {
     createFormat(L"Segoe UI Variable Display", 14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD,
                  controlFormat_);
 
+    createFormat(L"Segoe UI Variable Display", 26.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                 welcomeFormat_);
+    createFormat(L"Segoe UI Variable Display", 15.0f, DWRITE_FONT_WEIGHT_NORMAL,
+                 welcomeBodyFormat_);
+    createFormat(L"Segoe UI Variable Display", 13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                 hintKeyFormat_);
+    createFormat(L"Segoe UI Variable Display", 13.0f, DWRITE_FONT_WEIGHT_NORMAL,
+                 hintTextFormat_);
+
     controlFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     controlFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+    welcomeFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    welcomeBodyFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    // Las teclas se alinean a la derecha y su descripcion a la izquierda: las
+    // dos columnas quedan a ras sin necesidad de tabulaciones.
+    hintKeyFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     timeFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     titleFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
@@ -267,11 +345,13 @@ void Overlay::Repaint() {
     d2dContext_->BeginDraw();
     d2dContext_->Clear(Rgba(0, 0, 0, 0));   // totalmente transparente
 
-    if (model_.showControls) {
+    if (model_.showWelcome) {
+        DrawWelcome(width_, height_);
+    } else if (model_.showControls) {
         DrawControlBar(width_, height_);
     }
     // El menu se dibuja despues de la barra para quedar por encima de ella.
-    if (model_.showControls && model_.speedMenuOpen) {
+    if (model_.showControls && !model_.showWelcome && model_.speedMenuOpen) {
         DrawSpeedMenu();
     }
     if (model_.showStats) {
@@ -297,22 +377,34 @@ void Overlay::DrawControlBar(unsigned width, unsigned height) {
     // Fondo degradado simulado con dos bandas semitransparentes: mas barato que
     // un pincel de degradado real y visualmente equivalente a este tamano.
     brush_->SetColor(Rgba(0, 0, 0, 0.35f));
-    d2dContext_->FillRectangle(D2D1::RectF(0, h - kBarHeight, w, h - kBarHeight * 0.5f), brush_.Get());
-    brush_->SetColor(Rgba(0, 0, 0, 0.65f));
+    d2dContext_->FillRectangle(D2D1::RectF(0, h - kBarHeight, w, h - kBarHeight * 0.5f),
+                               brush_.Get());
+    brush_->SetColor(Rgba(0, 0, 0, 0.70f));
     d2dContext_->FillRectangle(D2D1::RectF(0, h - kBarHeight * 0.5f, w, h), brush_.Get());
 
+    // --- Titulo ------------------------------------------------------------
+    if (!model_.title.empty()) {
+        brush_->SetColor(Rgba(1, 1, 1, 0.88f));
+        d2dContext_->DrawTextW(model_.title.c_str(),
+                               static_cast<UINT32>(model_.title.size()),
+                               titleFormat_.Get(),
+                               D2D1::RectF(kMargin, h - kBarHeight + 8.0f,
+                                           w - kMargin, h - kSeekBarY - 10.0f),
+                               brush_.Get());
+    }
+
     // --- Barra de progreso -------------------------------------------------
-    // Se acorta para dejar sitio a los indicadores de la derecha.
+    // Ocupa el ancho completo: los controles viven en su propia fila.
     const float barLeft  = kMargin;
-    const float barRight = w - kMargin - kControlsWidth - kControlGap;
+    const float barRight = w - kMargin;
     const float barY     = h - kSeekBarY;
 
     seekBarRect_ = D2D1::RectF(barLeft, barY - kSeekBarHeight * 0.5f,
                                barRight, barY + kSeekBarHeight * 0.5f);
 
-    const D2D1_ROUNDED_RECT track = D2D1::RoundedRect(seekBarRect_, 3.0f, 3.0f);
     brush_->SetColor(Rgba(1, 1, 1, 0.25f));
-    d2dContext_->FillRoundedRectangle(track, brush_.Get());
+    d2dContext_->FillRoundedRectangle(D2D1::RoundedRect(seekBarRect_, 3.0f, 3.0f),
+                                      brush_.Get());
 
     double progress = 0.0;
     if (model_.duration != kNoTimestamp && model_.duration > 0) {
@@ -325,40 +417,90 @@ void Overlay::DrawControlBar(unsigned width, unsigned height) {
         D2D1_RECT_F filled = seekBarRect_;
         filled.right = barLeft + static_cast<float>((barRight - barLeft) * progress);
         brush_->SetColor(Rgba(0.35f, 0.72f, 1.0f, 0.95f));
-        d2dContext_->FillRoundedRectangle(D2D1::RoundedRect(filled, 3.0f, 3.0f), brush_.Get());
+        d2dContext_->FillRoundedRectangle(D2D1::RoundedRect(filled, 3.0f, 3.0f),
+                                          brush_.Get());
 
-        // Cabezal
         brush_->SetColor(Rgba(1, 1, 1, 1));
         d2dContext_->FillEllipse(
             D2D1::Ellipse(D2D1::Point2F(filled.right, barY), 7.0f, 7.0f), brush_.Get());
     }
 
-    DrawSpeedControl(w - kMargin, barY);
+    // --- Fila de botones ---------------------------------------------------
+    const float rowY = h - kButtonRowY;
 
-    // --- Reloj -------------------------------------------------------------
+    DrawTransport(kMargin, rowY);
+    DrawSpeedControl(w - kMargin, rowY);
+
+    // El reloj arranca despues de los botones de transporte.
+    const float clockLeft = stepForwardRect_.right + 16.0f;
+
     std::wstring clock = FormatTime(model_.position);
     if (model_.duration != kNoTimestamp) {
         clock += L"  /  " + FormatTime(model_.duration);
     }
-    if (model_.paused) clock += L"   PAUSA";
-    if (model_.muted)  clock += L"   SIN SONIDO";
+    if (model_.muted) clock += L"   SIN SONIDO";
 
     brush_->SetColor(Rgba(1, 1, 1, 0.92f));
     d2dContext_->DrawTextW(clock.c_str(), static_cast<UINT32>(clock.size()),
                            timeFormat_.Get(),
-                           D2D1::RectF(kMargin, h - 26.0f, w - kMargin, h - 4.0f),
-                           brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                           D2D1::RectF(clockLeft, rowY - 12.0f,
+                                       speedRect_.left - 12.0f, rowY + 12.0f),
+                           brush_.Get());
+}
 
-    // --- Titulo ------------------------------------------------------------
-    if (!model_.title.empty()) {
-        brush_->SetColor(Rgba(1, 1, 1, 0.88f));
-        d2dContext_->DrawTextW(model_.title.c_str(),
-                               static_cast<UINT32>(model_.title.size()),
-                               titleFormat_.Get(),
-                               D2D1::RectF(kMargin, h - kBarHeight + 10.0f,
-                                           w - kMargin, h - kSeekBarY - 12.0f),
-                               brush_.Get());
+// ---------------------------------------------------------------------------
+//  Botones de transporte
+//
+//  Reproducir, un fotograma atras y un fotograma adelante. Los atajos de
+//  teclado ya existian, pero quien abre el programa por primera vez no los
+//  conoce: sin botones visibles no hay forma de descubrir que el avance
+//  fotograma a fotograma existe.
+// ---------------------------------------------------------------------------
+void Overlay::DrawTransport(float left, float centerY) {
+    const float half = kButtonSize * 0.5f;
+
+    const auto makeRect = [&](float x) {
+        return D2D1::RectF(x, centerY - half, x + kButtonSize, centerY + half);
+    };
+
+    playRect_        = makeRect(left);
+    stepBackRect_    = makeRect(left + kButtonSize + kButtonGap);
+    stepForwardRect_ = makeRect(left + 2.0f * (kButtonSize + kButtonGap));
+
+    const auto centerOf = [](const D2D1_RECT_F& rect) {
+        return D2D1::Point2F((rect.left + rect.right) * 0.5f,
+                             (rect.top + rect.bottom) * 0.5f);
+    };
+
+    brush_->SetColor(Rgba(1, 1, 1, 0.88f));
+
+    // Reproducir o pausar.
+    const D2D1_POINT_2F playCenter = centerOf(playRect_);
+    if (model_.paused) {
+        FillTriangle(d2dContext_.Get(), triangleGeometry_.Get(), brush_.Get(),
+                     playCenter, 1.0f, true);
+    } else {
+        FillPauseBars(d2dContext_.Get(), brush_.Get(), playCenter);
     }
+
+    // Paso atras y adelante: triangulo con un tope, como en cualquier
+    // reproductor. El tope indica "solo uno", frente al triangulo suelto del
+    // play, que significa "sigue".
+    const auto drawStep = [&](const D2D1_RECT_F& rect, bool forward) {
+        const D2D1_POINT_2F center = centerOf(rect);
+        const float offset = forward ? -2.0f : 2.0f;
+
+        FillTriangle(d2dContext_.Get(), triangleGeometry_.Get(), brush_.Get(),
+                     D2D1::Point2F(center.x + offset, center.y), 0.82f, forward);
+
+        const float barX = forward ? center.x + 6.0f : center.x - 8.0f;
+        d2dContext_->FillRectangle(
+            D2D1::RectF(barX, center.y - 6.6f, barX + 2.2f, center.y + 6.6f),
+            brush_.Get());
+    };
+
+    drawStep(stepBackRect_, false);
+    drawStep(stepForwardRect_, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +589,104 @@ void Overlay::DrawSpeedMenu() {
     }
 }
 
+// ---------------------------------------------------------------------------
+//  Pantalla de bienvenida
+//
+//  Sin medio abierto la ventana era negra y muda. Quien abre el programa por
+//  primera vez no tiene forma de saber que acepta archivos arrastrados, ni que
+//  existe un dialogo, ni que hay atajos. Este recuadro resuelve las tres cosas
+//  de una vez, y ademas es clicable entero: no hace falta acertar en un boton.
+// ---------------------------------------------------------------------------
+void Overlay::DrawWelcome(unsigned width, unsigned height) {
+    const float w = static_cast<float>(width);
+    const float h = static_cast<float>(height);
+
+    // Fondo: un velo oscuro sobre el negro para que el recuadro no flote en el
+    // vacio y se lea como una superficie.
+    brush_->SetColor(Rgba(0.04f, 0.05f, 0.07f, 1.0f));
+    d2dContext_->FillRectangle(D2D1::RectF(0, 0, w, h), brush_.Get());
+
+    const float boxWidth  = std::min(560.0f, w - 64.0f);
+    const float boxHeight = std::min(330.0f, h - 64.0f);
+    const float left      = (w - boxWidth) * 0.5f;
+    const float top       = (h - boxHeight) * 0.5f;
+    const float centerX   = w * 0.5f;
+
+    const D2D1_ROUNDED_RECT box = D2D1::RoundedRect(
+        D2D1::RectF(left, top, left + boxWidth, top + boxHeight), 14.0f, 14.0f);
+
+    brush_->SetColor(Rgba(1, 1, 1, 0.035f));
+    d2dContext_->FillRoundedRectangle(box, brush_.Get());
+    brush_->SetColor(Rgba(1, 1, 1, 0.22f));
+    d2dContext_->DrawRoundedRectangle(box, brush_.Get(), 1.6f, dashedStroke_.Get());
+
+    // --- Icono -------------------------------------------------------------
+    const D2D1_POINT_2F iconCenter = D2D1::Point2F(centerX, top + 62.0f);
+
+    brush_->SetColor(Rgba(0.35f, 0.72f, 1.0f, 0.22f));
+    d2dContext_->FillEllipse(D2D1::Ellipse(iconCenter, 30.0f, 30.0f), brush_.Get());
+    brush_->SetColor(Rgba(0.45f, 0.80f, 1.0f, 0.95f));
+    FillTriangle(d2dContext_.Get(), triangleGeometry_.Get(), brush_.Get(),
+                 D2D1::Point2F(iconCenter.x + 2.0f, iconCenter.y), 1.5f, true);
+
+    // --- Textos ------------------------------------------------------------
+    static constexpr std::wstring_view kTitle = L"Arrastra un vídeo aquí";
+    brush_->SetColor(Rgba(1, 1, 1, 0.94f));
+    d2dContext_->DrawTextW(kTitle.data(), static_cast<UINT32>(kTitle.size()),
+                           welcomeFormat_.Get(),
+                           D2D1::RectF(left, top + 108.0f, left + boxWidth, top + 148.0f),
+                           brush_.Get());
+
+    static constexpr std::wstring_view kSubtitle =
+        L"o haz clic en cualquier punto para abrir un archivo";
+    brush_->SetColor(Rgba(1, 1, 1, 0.55f));
+    d2dContext_->DrawTextW(kSubtitle.data(), static_cast<UINT32>(kSubtitle.size()),
+                           welcomeBodyFormat_.Get(),
+                           D2D1::RectF(left, top + 150.0f, left + boxWidth, top + 178.0f),
+                           brush_.Get());
+
+    // --- Separador y atajos -------------------------------------------------
+    const float separatorY = top + 196.0f;
+    brush_->SetColor(Rgba(1, 1, 1, 0.12f));
+    d2dContext_->DrawLine(D2D1::Point2F(left + 40.0f, separatorY),
+                          D2D1::Point2F(left + boxWidth - 40.0f, separatorY),
+                          brush_.Get(), 1.0f);
+
+    // Dos columnas: las teclas alineadas a la derecha y su descripcion a la
+    // izquierda, de modo que queden a ras sin tabulaciones.
+    static constexpr std::wstring_view kKeysLeft  = L"Espacio\nIzq / Der\nF";
+    static constexpr std::wstring_view kTextLeft  =
+        L"reproducir o pausar\nfotograma a fotograma\npantalla completa";
+    static constexpr std::wstring_view kKeysRight = L"Ctrl + rueda\nZ / X\nS";
+    static constexpr std::wstring_view kTextRight =
+        L"ampliar\najustar / tamaño real\nguardar el fotograma";
+
+    const float hintTop    = separatorY + 16.0f;
+    const float hintBottom = top + boxHeight - 12.0f;
+    const float columnWide = (boxWidth - 80.0f) * 0.5f;
+    const float keyWidth   = 76.0f;
+
+    const auto drawColumn = [&](float columnLeft, std::wstring_view keys,
+                                std::wstring_view text) {
+        brush_->SetColor(Rgba(0.45f, 0.80f, 1.0f, 0.85f));
+        d2dContext_->DrawTextW(keys.data(), static_cast<UINT32>(keys.size()),
+                               hintKeyFormat_.Get(),
+                               D2D1::RectF(columnLeft, hintTop,
+                                           columnLeft + keyWidth, hintBottom),
+                               brush_.Get());
+
+        brush_->SetColor(Rgba(1, 1, 1, 0.62f));
+        d2dContext_->DrawTextW(text.data(), static_cast<UINT32>(text.size()),
+                               hintTextFormat_.Get(),
+                               D2D1::RectF(columnLeft + keyWidth + 10.0f, hintTop,
+                                           columnLeft + columnWide, hintBottom),
+                               brush_.Get());
+    };
+
+    drawColumn(left + 40.0f, kKeysLeft, kTextLeft);
+    drawColumn(left + 40.0f + columnWide, kKeysRight, kTextRight);
+}
+
 void Overlay::DrawStats(unsigned width) {
     if (model_.stats.empty()) return;
 
@@ -510,8 +750,8 @@ void Overlay::Render(SwapChain& swapChain) {
     EnsureSurface(swapChain.Width(), swapChain.Height());
     if (!surfaceView_) return;
 
-    const bool hasContent =
-        model_.showControls || model_.showStats || !model_.toast.empty();
+    const bool hasContent = model_.showWelcome || model_.showControls ||
+                            model_.showStats || !model_.toast.empty();
     if (!hasContent) return;
 
     if (dirty_) Repaint();
@@ -561,13 +801,28 @@ void Overlay::Render(SwapChain& swapChain) {
     context->PSSetShaderResources(0, 1, none);
 }
 
+bool Overlay::HitTestPlayPause(int x, int y) const noexcept {
+    if (!model_.showControls || model_.showWelcome) return false;
+    return Contains(playRect_, static_cast<float>(x), static_cast<float>(y));
+}
+
+bool Overlay::HitTestStepBack(int x, int y) const noexcept {
+    if (!model_.showControls || model_.showWelcome) return false;
+    return Contains(stepBackRect_, static_cast<float>(x), static_cast<float>(y));
+}
+
+bool Overlay::HitTestStepForward(int x, int y) const noexcept {
+    if (!model_.showControls || model_.showWelcome) return false;
+    return Contains(stepForwardRect_, static_cast<float>(x), static_cast<float>(y));
+}
+
 bool Overlay::HitTestSpeed(int x, int y) const noexcept {
-    if (!model_.showControls) return false;
+    if (!model_.showControls || model_.showWelcome) return false;
     return Contains(speedRect_, static_cast<float>(x), static_cast<float>(y));
 }
 
 bool Overlay::HitTestSnapshot(int x, int y) const noexcept {
-    if (!model_.showControls) return false;
+    if (!model_.showControls || model_.showWelcome) return false;
     return Contains(snapshotRect_, static_cast<float>(x), static_cast<float>(y));
 }
 
@@ -588,7 +843,7 @@ int Overlay::HitTestSpeedMenu(int x, int y) const noexcept {
 }
 
 Micros Overlay::HitTestSeekBar(int x, int y) const noexcept {
-    if (!model_.showControls) return kNoTimestamp;
+    if (!model_.showControls || model_.showWelcome) return kNoTimestamp;
     if (model_.duration == kNoTimestamp || model_.duration <= 0) return kNoTimestamp;
 
     // Margen vertical generoso: acertar una barra de 6 px con el raton es
@@ -617,6 +872,12 @@ void Overlay::Destroy() noexcept {
     d2dDevice_.Reset();
     d2dFactory_.Reset();
 
+    dashedStroke_.Reset();
+    triangleGeometry_.Reset();
+    hintTextFormat_.Reset();
+    hintKeyFormat_.Reset();
+    welcomeBodyFormat_.Reset();
+    welcomeFormat_.Reset();
     controlFormat_.Reset();
     statsFormat_.Reset();
     titleFormat_.Reset();

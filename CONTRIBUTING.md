@@ -49,9 +49,12 @@ Convenciones que `clang-format` no puede aplicar:
   módulo. Si añades un módulo, mantén la costumbre.
 - Clases y funciones en `PascalCase`, variables en `camelCase`, miembros con
   `trailing_`, constantes con `kPrefijo`.
-- Sin acentos ni caracteres no ASCII en los archivos de `src/` y `res/`: el
-  compilador de recursos y algunas herramientas de la cadena no los tratan
-  igual. La documentación en Markdown sí los lleva.
+- **Comentarios y código, solo ASCII.** El riesgo real está en `res/*.rc`, que
+  el compilador de recursos no interpreta como UTF-8; mantener la regla también
+  en los comentarios evita discutir dónde acaba la frontera.
+- **El texto que ve el usuario lleva tildes.** Son literales anchos (`L"..."`)
+  en archivos compilados con `/utf-8`: MSVC los convierte a UTF-16 sin
+  problema, y un reproductor en español que dice «video aqui» se ve roto.
 
 ## Errores
 

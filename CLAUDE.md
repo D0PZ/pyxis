@@ -302,6 +302,11 @@ a ocho horas de metraje acumula error suficiente para desincronizar el audio.
 **Texto.** UTF-16 en la frontera con Win32, UTF-8 hacia dentro. Toda conversión
 pasa por `core/Text.hpp`.
 
+Los comentarios y el código van en ASCII; el texto que ve el usuario, no. Los
+literales anchos (`L"Arrastra un vídeo aquí"`) se compilan con `/utf-8` y
+llegan correctos a DirectWrite. La única excepción de verdad es `res/*.rc`, que
+el compilador de recursos no lee como UTF-8.
+
 **Comentarios.** Explican el **porqué**, nunca el qué. Si un comentario se puede
 deducir leyendo la línea siguiente, sobra. Cada cabecera abre con un bloque que
 justifica las decisiones de diseño del módulo; mantener esa costumbre al añadir
