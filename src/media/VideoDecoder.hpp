@@ -88,7 +88,7 @@ private:
                                          const AVPixelFormat* formats) noexcept;
 
     void CreateHardwareDevice(const Config& config);
-    void ConfigureSoftwareThreads();
+    void ConfigureDecodeThreads(bool hardwareAvailable);
 
     // Convierte un fotograma de software a NV12/P010 para cumplir el contrato.
     [[nodiscard]] bool NormalizeSoftwareFrame(AVFrame* source, VideoFrame& out);

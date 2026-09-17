@@ -5,6 +5,10 @@
 #include "core/Text.hpp"
 #include "core/Thread.hpp"
 
+#include <d3d11.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -21,18 +25,53 @@ constexpr Micros kFrameTolerance = 8000;   // 8 ms
 // estadisticas. Es diagnostico, no afecta a la reproduccion.
 constexpr Micros kLateThreshold = 40000;   // 40 ms
 
-// Presupuesto de memoria de video para el historial de fotogramas. Con la ruta
-// zero-copy, guardar un fotograma no copia pixeles pero si retiene una plaza
-// del pool de texturas, asi que el limite se reparte segun la resolucion: mucha
-// holgura en 1080p, la justa en 8K.
-// A 8K un fotograma ronda los 100 MiB, asi que el presupuesto decide cuantos
-// pasos atras son instantaneos: con 384 MiB salen 3 en 8K, el tope de 12 en 4K
-// y en 1080p. Subirlo mas tiene rendimientos decrecientes -entre salto y salto
-// hay que redecodificar el grupo de imagenes de todos modos- y penaliza a las
-// graficas modestas.
-constexpr std::size_t kHistoryBudgetBytes = 384u * 1024u * 1024u;
+// Historial de fotogramas: cuantos pasos atras son instantaneos.
+//
+// Con la ruta zero-copy, conservar un fotograma no copia pixeles pero si retiene
+// una plaza del pool de texturas. A 8K eso son unos 100 MiB por plaza, asi que
+// el limite NO puede ser un numero fijo: lo que sobra en una tarjeta de 16 GiB
+// ahoga a una de 4. Se consulta la memoria realmente disponible y se toma una
+// fraccion.
+//
+// La fraccion es conservadora a proposito. Pyxis no es la unica aplicacion con
+// derecho a la memoria de video, y ademas el presupuesto que reporta DXGI baja
+// en cuanto otro programa empieza a pedir: quedarse con la mitad seria correcto
+// hoy y un problema en cuanto se abra un navegador.
+constexpr double      kHistoryMemoryShare = 0.25;
 constexpr std::size_t kHistoryMinFrames   = 3;
-constexpr std::size_t kHistoryMaxFrames   = 12;
+constexpr std::size_t kHistoryMaxFrames   = 48;
+
+// Tope del rebobinado. Con un historial grande la ventana crece con el, pero
+// decodificar varios segundos de 8K para mostrar un fotograma tampoco vale la
+// pena: a partir de aqui se prefiere rebobinar mas veces.
+constexpr Micros kMaxRewindWindow = 2 * kMicrosPerSecond;
+
+// Memoria de video libre, en bytes. Devuelve cero si no se puede averiguar, y
+// entonces se cae al minimo.
+[[nodiscard]] std::size_t AvailableVideoMemory(ID3D11Device* device) noexcept {
+    if (device == nullptr) return 0;
+
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice)))) return 0;
+
+    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+    if (FAILED(dxgiDevice->GetAdapter(&adapter))) return 0;
+
+    // QueryVideoMemoryInfo da el presupuesto que el sistema asigna AHORA a este
+    // proceso, no la memoria total de la tarjeta. Es el numero correcto: la
+    // total no descuenta lo que ya estan usando el escritorio y el resto de
+    // aplicaciones.
+    Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter3;
+    if (FAILED(adapter.As(&adapter3))) return 0;
+
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+        return 0;
+    }
+    return info.Budget > info.CurrentUsage
+               ? static_cast<std::size_t>(info.Budget - info.CurrentUsage)
+               : 0;
+}
 
 // Ventana minima que se rebobina al retroceder cuando el historial no alcanza.
 // Con tasa variable, la duracion del fotograma actual es mala estimacion de la
@@ -72,8 +111,13 @@ void Player::Open(const std::wstring& path) {
 
         if (HasVideo()) {
             const AVCodecParameters* params = demuxer_.Video().params;
+
+            // Plazas que no son historial: la cola de presentacion, el
+            // fotograma en pantalla, el reservado y un margen para los
+            // fotogramas que los hilos del decodificador tienen en vuelo.
+            const std::size_t reserved = videoFrames_.Capacity() + 10;
             const std::size_t historyLimit =
-                ComputeHistoryLimit(params->width, params->height);
+                ComputeHistoryLimit(params->width, params->height, reserved);
             historyLimit_.store(historyLimit, std::memory_order_release);
 
             VideoDecoder::Config config;
@@ -85,12 +129,13 @@ void Player::Open(const std::wstring& path) {
             // fotograma que el presentador esta mostrando y el que tiene
             // reservado. Quedarse corto bloquea al decodificador en cada
             // fotograma.
-            config.extraPoolFrames =
-                static_cast<int>(videoFrames_.Capacity() + historyLimit + 4);
+            config.extraPoolFrames = static_cast<int>(reserved + historyLimit);
 
             videoDecoder_.Open(demuxer_.Video(), config);
 
-            PYXIS_INFO("Historial de avance manual: {} fotogramas", historyLimit);
+            PYXIS_INFO("Historial de avance manual: {} fotogramas "
+                       "({} MiB de memoria de video libre)",
+                       historyLimit, AvailableVideoMemory(device_) / (1024 * 1024));
         }
 
         if (HasAudio()) {
@@ -538,7 +583,8 @@ Player::FrameSelection Player::SelectFrame(VideoFrame& out) {
     return FrameSelection::Updated;
 }
 
-std::size_t Player::ComputeHistoryLimit(int width, int height) noexcept {
+std::size_t Player::ComputeHistoryLimit(int width, int height,
+                                        std::size_t reservedFrames) const noexcept {
     if (width <= 0 || height <= 0) return kHistoryMinFrames;
 
     // Tres bytes por pixel es el peor caso (P010: luma de 16 bits mas croma
@@ -547,8 +593,17 @@ std::size_t Player::ComputeHistoryLimit(int width, int height) noexcept {
     const std::size_t bytesPerFrame =
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3u;
 
-    const std::size_t affordable = kHistoryBudgetBytes / std::max<std::size_t>(bytesPerFrame, 1);
-    return std::clamp(affordable, kHistoryMinFrames, kHistoryMaxFrames);
+    const std::size_t available = AvailableVideoMemory(device_);
+    if (available == 0) return kHistoryMinFrames;
+
+    const auto budget = static_cast<std::size_t>(available * kHistoryMemoryShare);
+    const std::size_t affordable = budget / std::max<std::size_t>(bytesPerFrame, 1);
+
+    // El presupuesto cubre TODO el pool extra, no solo el historial: la cola de
+    // presentacion y los fotogramas en vuelo tambien ocupan plaza.
+    if (affordable <= reservedFrames) return kHistoryMinFrames;
+
+    return std::clamp(affordable - reservedFrames, kHistoryMinFrames, kHistoryMaxFrames);
 }
 
 VideoFrame Player::CloneFrameRef(const VideoFrame& source) {
@@ -652,6 +707,7 @@ void Player::PrepareStepCollection(int direction) {
 
     Micros window = step * batch;
     if (window < kMinRewindWindow) window = kMinRewindWindow;
+    if (window > kMaxRewindWindow) window = kMaxRewindWindow;
 
     ForgetHistory();
 
@@ -696,7 +752,17 @@ Player::FrameSelection Player::SelectSteppedFrame(VideoFrame& out) {
     for (;;) {
         if (!pendingFrame_.IsValid()) {
             if (!videoFrames_.TryPop(pendingFrame_)) {
-                // El fotograma buscado todavia se esta decodificando. Se
+                // Si ya no puede llegar nada mas, el paso se CANCELA. Dejarlo
+                // pendiente dejaba el avance muerto: StepFrame descarta las
+                // pulsaciones mientras hay uno en vuelo, asi que un paso hacia
+                // delante en el ultimo fotograma bloqueaba la herramienta hasta
+                // reproducir o saltar.
+                if (demuxFinished_.load(std::memory_order_acquire) &&
+                    videoPackets_.Size() == 0) {
+                    stepPending_.store(false, std::memory_order_release);
+                }
+
+                // Si no, el fotograma buscado todavia se esta decodificando: se
                 // conserva el que hay en pantalla -nada de fundidos a negro- y
                 // se reintenta en la siguiente presentacion.
                 return FrameSelection::None;
@@ -730,10 +796,14 @@ Player::FrameSelection Player::SelectSteppedFrame(VideoFrame& out) {
                         return FrameSelection::None;
                     }
 
-                    const Micros widened = (collectBefore_ - collectFrom_) * 2;
-                    collectFrom_ = collectBefore_ - widened > 0
-                                       ? collectBefore_ - widened
-                                       : 0;
+                    // Duplicar la ventana. El suelo importa: si por lo que
+                    // fuera llegase vacia, el destino coincidiria con el limite
+                    // y el reintento repetiria el mismo salto para siempre.
+                    Micros window = collectBefore_ - collectFrom_;
+                    if (window < kMinRewindWindow) window = kMinRewindWindow;
+                    window *= 2;
+
+                    collectFrom_ = collectBefore_ > window ? collectBefore_ - window : 0;
                     pendingFrame_ = VideoFrame{};
                     RequestSeekInternal(collectFrom_);
                     presenterGeneration_ = generation_.load(std::memory_order_acquire);
@@ -744,7 +814,7 @@ Player::FrameSelection Player::SelectSteppedFrame(VideoFrame& out) {
                 out = CloneFrameRef(history_[historyCursor_]);
                 if (!out.IsValid()) return FrameSelection::None;
 
-                clock_.Reset(out.pts);
+                if (out.pts != kNoTimestamp) clock_.Reset(out.pts);
                 NoteDisplayedFrame(out);
                 stepPending_.store(false, std::memory_order_release);
 
@@ -753,11 +823,21 @@ Player::FrameSelection Player::SelectSteppedFrame(VideoFrame& out) {
                 return FrameSelection::Updated;
             }
 
+            // Un fotograma sin marca de tiempo no se puede situar respecto al
+            // limite, asi que el paso atras no tendria forma de terminar. Es
+            // propio de flujos crudos sin contenedor; se cancela en vez de
+            // girar indefinidamente.
+            if (pts == kNoTimestamp) {
+                PYXIS_DEBUG("paso atras cancelado: el flujo no tiene marcas de tiempo");
+                pendingFrame_ = VideoFrame{};
+                stepPending_.store(false, std::memory_order_release);
+                return FrameSelection::None;
+            }
+
             // Anterior al actual: se guarda en el historial y se sigue. Esto es
             // lo que convierte un salto en varios pasos atras gratis.
-            if (pts == kNoTimestamp || pts >= collectFrom_) {
-                PushHistory(pendingFrame_);
-            }
+            if (pts >= collectFrom_) PushHistory(pendingFrame_);
+
             pendingFrame_ = VideoFrame{};
             continue;
         }
@@ -909,6 +989,11 @@ void Player::RequestSeekInternal(Micros target) {
     // suelta solo al ver la generacion nueva (ver SelectFrame).
 
     // 3. Peticion al demultiplexor, que es el unico dueno del contenedor.
+    // Se limpia aqui y no solo en el hilo de demultiplexado: entre la peticion
+    // y su atencion hay una ventana en la que el avance manual creeria que ya no
+    // puede llegar nada mas y cancelaria el paso.
+    demuxFinished_.store(false, std::memory_order_release);
+
     seekTarget_.store(target, std::memory_order_release);
     seekPending_.store(true, std::memory_order_release);
 

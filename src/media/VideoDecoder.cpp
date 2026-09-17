@@ -118,11 +118,38 @@ AVPixelFormat VideoDecoder::NegotiateFormat(AVCodecContext* context,
         d3dFrames->BindFlags |= D3D11_BIND_SHADER_RESOURCE;
 
         // Holgura para los fotogramas que Pyxis mantiene en la cola de
-        // presentacion. Sin ella el decodificador se bloquea esperando a que el
-        // renderizador suelte texturas, y aparecen microcortes.
-        framesContext->initial_pool_size += self != nullptr ? self->extraPool_ : 8;
+        // presentacion y en el historial del avance manual. Sin ella el
+        // decodificador se bloquea esperando a que el renderizador suelte
+        // texturas, y aparecen microcortes.
+        const int requested = self != nullptr ? self->extraPool_ : 8;
+        const int baseSize  = framesContext->initial_pool_size;
+        framesContext->initial_pool_size = baseSize + requested;
 
         rc = ::av_hwframe_ctx_init(frames);
+
+        // Si no cabe, se reintenta con lo justo ANTES de rendirse. Caer a
+        // software por pedir un pool generoso seria un desastre: la holgura es
+        // una comodidad, la aceleracion no.
+        if (rc < 0 && requested > 4) {
+            PYXIS_WARN("el pool de {} texturas no cupo ({}); se reintenta con {}",
+                       baseSize + requested, DescribeError(ErrorDomain::FFmpeg, rc),
+                       baseSize + 4);
+
+            ::av_buffer_unref(&frames);
+            if (::avcodec_get_hw_frames_parameters(context, context->hw_device_ctx,
+                                                   AV_PIX_FMT_D3D11, &frames) < 0) {
+                break;
+            }
+            framesContext = reinterpret_cast<AVHWFramesContext*>(frames->data);
+            d3dFrames     = static_cast<AVD3D11VAFramesContext*>(framesContext->hwctx);
+
+            d3dFrames->BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+            framesContext->initial_pool_size += 4;
+            if (self != nullptr) self->extraPool_ = 4;
+
+            rc = ::av_hwframe_ctx_init(frames);
+        }
+
         if (rc < 0) {
             PYXIS_WARN("no se pudo inicializar el pool de texturas D3D11VA: {}",
                        DescribeError(ErrorDomain::FFmpeg, rc));
@@ -186,13 +213,31 @@ void VideoDecoder::CreateHardwareDevice(const Config& config) {
     hwDevice_ = std::move(reference);
 }
 
-void VideoDecoder::ConfigureSoftwareThreads() {
-    // Solo afecta al repliegue por software. FF_THREAD_FRAME escala mucho mejor
-    // que SLICE en codecs modernos, pero anade latencia de varios fotogramas;
-    // se habilitan ambos y el codec elige el que soporta.
+void VideoDecoder::ConfigureDecodeThreads(bool hardwareAvailable) {
+    codec_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+
+    if (hardwareAvailable) {
+        // CON ACELERACION, POCOS HILOS.
+        //
+        // Es facil pensar que el numero de hilos solo importa en la ruta por
+        // software -el trabajo lo hace la GPU-, pero es falso y sale caro: con
+        // FF_THREAD_FRAME cada hilo mantiene SU PROPIO juego de fotogramas de
+        // referencia, y en la ruta acelerada esos fotogramas son plazas del pool
+        // de texturas. Pedir treinta y dos hilos multiplica la demanda del pool
+        // hasta agotarlo, y entonces el decodificador deja de producir: el
+        // sintoma es "Static surface pool size exceeded" seguido de
+        // "get_buffer() failed", con la imagen congelada.
+        //
+        // Cuatro bastan para que el controlador encadene envios a la GPU sin
+        // burbujas. La decodificacion no es el cuello de botella aqui.
+        codec_->thread_count = 4;
+        return;
+    }
+
+    // Por software si hacen falta todos: es donde el paralelismo decide si un
+    // 4K va fluido o a trompicones.
     const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
     codec_->thread_count = static_cast<int>(std::min(cores, 32u));
-    codec_->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
 }
 
 void VideoDecoder::Open(const Demuxer::Track& track, const Config& config) {
@@ -227,7 +272,10 @@ void VideoDecoder::Open(const Demuxer::Track& track, const Config& config) {
         }
     }
 
-    ConfigureSoftwareThreads();
+    // El numero de hilos depende de si habra aceleracion, y eso hay que decidirlo
+    // ANTES de abrir el codec: la negociacion real ocurre en el primer
+    // fotograma, demasiado tarde para cambiarlo.
+    ConfigureDecodeThreads(hwDevice_ != nullptr);
 
     PYXIS_CHECK_AV(::avcodec_open2(codec_.get(), decoder, nullptr),
                    "no se pudo abrir el decodificador de video");

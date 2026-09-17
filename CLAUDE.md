@@ -253,6 +253,35 @@ presentación (dueño del fotograma y del renderizador, y por eso inicializa COM
 que WIC necesita) y el recorte en un hilo propio que el `Controller` recoge en
 su destructor.
 
+## El pool de texturas y los hilos del decodificador
+
+Dos cosas compiten por el mismo recurso y es fácil no verlo.
+
+El historial del avance manual conserva fotogramas con `av_frame_ref`, que no
+copia píxeles pero **retiene una plaza del pool de D3D11VA**. A 8K cada plaza son
+unos 100 MiB, así que el tamaño no puede ser un número fijo: se calcula con
+`IDXGIAdapter3::QueryVideoMemoryInfo` sobre la memoria realmente disponible, no
+sobre la total de la tarjeta.
+
+Lo que no es evidente: **el número de hilos del decodificador también consume
+pool**. Con `FF_THREAD_FRAME` cada hilo mantiene su propio juego de fotogramas de
+referencia, y en la ruta acelerada esos fotogramas salen del mismo sitio. Pedir
+32 hilos —razonable por software— multiplica la demanda hasta agotarlo:
+
+```
+Static surface pool size exceeded
+get_buffer() failed
+```
+
+A partir de ahí el decodificador deja de producir y la imagen se congela. Por eso
+`ConfigureDecodeThreads` pide **4 hilos cuando hay aceleración** y todos los que
+haya cuando no: con la GPU decodificando, más hilos no aportan nada y sí cuestan
+memoria.
+
+Si aun así el pool no cabe, `NegotiateFormat` reintenta con lo justo antes de
+rendirse. Caer a software por haber pedido holgura sería mucho peor que perder
+la holgura.
+
 ## Trampas conocidas
 
 - **`D3D11_BIND_SHADER_RESOURCE` en el pool de D3D11VA.** Se añade en
@@ -306,6 +335,17 @@ su destructor.
 - **Arrastrar la barra genera más de cien mensajes por segundo.** Cada salto
   vacía tres colas y reinicia el audio, así que se limitan (`RequestScrubSeek`)
   y solo el de soltar está garantizado.
+
+- **Un paso pendiente que nunca llega deja el avance muerto.** `StepFrame`
+  descarta las pulsaciones mientras hay uno en vuelo, así que si la recogida no
+  puede terminar —se acabó el archivo, el flujo no tiene marcas de tiempo— hay
+  que **cancelar** el paso, no dejarlo esperando. Al pedir un salto se limpia
+  `demuxFinished_` en el acto: entre la petición y su atención habría una ventana
+  en la que la cancelación saltaría por error.
+
+- **Los límites del rebobinado se duplican, así que nunca pueden valer cero.**
+  Una ventana vacía haría que el reintento repitiera el mismo salto para
+  siempre.
 
 ---
 

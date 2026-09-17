@@ -218,7 +218,8 @@ private:
 
     // Historial. Todo esto pertenece en exclusiva al hilo de presentacion.
     [[nodiscard]] static VideoFrame CloneFrameRef(const VideoFrame& source);
-    [[nodiscard]] static std::size_t ComputeHistoryLimit(int width, int height) noexcept;
+    [[nodiscard]] std::size_t ComputeHistoryLimit(int width, int height,
+                                                 std::size_t reservedFrames) const noexcept;
 
     void PushHistory(const VideoFrame& frame);
     void ForgetHistory() noexcept;
