@@ -110,6 +110,9 @@ velocidad con el botón de captura a la derecha.
 | `S` | guardar el fotograma como PNG |
 | `A` `B` | marcar el inicio y el final de un recorte |
 | `C` | descartar el recorte |
+| `E` | editar el encuadre |
+| `R` | encuadre completo |
+| `G` | panel de ajustes de imagen |
 | `I` | panel de estadísticas |
 | `O` | abrir archivo |
 | `Q` · `Esc` | salir |
@@ -170,6 +173,42 @@ un grupo de imágenes. Cortar exactamente en el fotograma pedido exigiría
 recodificar, y este binario no lleva codificadores H.264/HEVC a propósito —son
 los que arrastran dependencias y patentes—. Cuando el desfase se nota, Pyxis lo
 dice en el aviso.
+
+### Encuadre
+
+`E` abre el editor. El vídeo se sigue viendo **entero** con lo que queda fuera
+atenuado —para decidir un encuadre hay que ver lo que se está dejando fuera— y
+encima aparece el marco con ocho tiradores: cuatro esquinas y cuatro lados.
+Arrastrar dentro mueve el marco completo. Hay una regla de tercios como
+referencia y una etiqueta con el porcentaje resultante.
+
+`E` otra vez (o `Esc`) lo aplica: a partir de ahí el vídeo se ve recortado, con
+las proporciones corregidas —un 16:9 recortado a su mitad derecha es 8:9, y se
+muestra como tal—. `R` vuelve al fotograma completo.
+
+El encuadre no cuesta rendimiento: se combina con la corrección del relleno del
+decodificador, que el shader ya tenía que aplicar de todos modos. Las capturas
+lo respetan, así que el PNG es lo que se ve.
+
+### Ajustes de imagen
+
+`G` abre el panel: cinco deslizadores —exposición, brillo, contraste, saturación
+y gamma— y un gráfico de **bandas tonales** con tres puntos arrastrables
+(sombras, medios, altas luces).
+
+Los puntos se dibujan sobre la curva, en la altura que esa banda produce, así
+que arrastrarlos deforma el trazo que se está viendo. Las bandas se ponderan con
+campanas que se solapan, de modo que subir una no crea escalones en las vecinas.
+
+La exposición se aplica en **luz lineal** y el resto en dominio de display. No
+es un detalle menor: un paso de diafragma es una duplicación de la luz que
+entra, y eso solo es cierto antes de la curva de gamma; aplicarla sobre el valor
+codificado aclararía las sombras mucho más de lo que haría una cámara.
+
+> **El recorte temporal no se lleva el encuadre ni los ajustes.** Copia el flujo
+> sin recodificar, y aplicar una transformación de imagen exige decodificar y
+> volver a codificar. Pyxis avisa al exportar con ediciones activas en lugar de
+> entregar en silencio un archivo distinto del que se ve.
 
 ### Zoom
 
