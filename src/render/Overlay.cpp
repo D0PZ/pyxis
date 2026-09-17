@@ -711,6 +711,34 @@ void Overlay::DrawRightControls(float right, float centerY) {
     const D2D1_POINT_2F trimCenter =
         D2D1::Point2F((trimRect_.left + trimRect_.right) * 0.5f, centerY);
 
+    // Durante una exportacion larga la tijera se convierte en un anillo de
+    // progreso: un boton apagado sin mas dejaria la duda de si se ha colgado.
+    if (model_.trimBusy && model_.trimProgress >= 0) {
+        brush_->SetColor(Rgba(1, 1, 1, 0.16f));
+        d2dContext_->DrawEllipse(D2D1::Ellipse(trimCenter, 10.0f, 10.0f),
+                                 brush_.Get(), 2.4f);
+
+        const float sweep = static_cast<float>(model_.trimProgress) / 100.0f;
+
+        // Arco aproximado con segmentos rectos: a este tamano es
+        // indistinguible de una curva y ahorra construir una geometria nueva en
+        // cada repintado.
+        brush_->SetColor(TrimColor(0.98f));
+        constexpr int kSegments = 32;
+        const int filled = static_cast<int>(sweep * kSegments);
+        for (int i = 0; i < filled; ++i) {
+            const float a0 = -1.5708f + 6.2832f * static_cast<float>(i) / kSegments;
+            const float a1 = -1.5708f + 6.2832f * static_cast<float>(i + 1) / kSegments;
+            d2dContext_->DrawLine(
+                D2D1::Point2F(trimCenter.x + 10.0f * std::cos(a0),
+                              trimCenter.y + 10.0f * std::sin(a0)),
+                D2D1::Point2F(trimCenter.x + 10.0f * std::cos(a1),
+                              trimCenter.y + 10.0f * std::sin(a1)),
+                brush_.Get(), 2.4f);
+        }
+        return;
+    }
+
     brush_->SetColor(model_.trimBusy ? TrimColor(0.45f)
                                      : (ready ? TrimColor(0.98f) : Rgba(1, 1, 1, 0.32f)));
 

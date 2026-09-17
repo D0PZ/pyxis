@@ -120,6 +120,12 @@ public:
     [[nodiscard]] ComPtr<ID3D11Texture2D> RenderToTexture(const VideoFrame& frame,
                                                           AVRational sampleAspect);
 
+    // Dibuja sobre un destino que aporta el llamante, ocupandolo por completo.
+    // Lo usa la exportacion de recortes, que reutiliza la misma textura para
+    // miles de fotogramas en lugar de reservar una por cada uno.
+    void RenderToTarget(ID3D11RenderTargetView* target, unsigned width, unsigned height,
+                        const VideoFrame& frame);
+
     void SetAdjustments(const ImageAdjustments& adjustments) noexcept {
         adjustments_ = adjustments;
     }

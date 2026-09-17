@@ -243,10 +243,26 @@ propia textura en vez de copiar el búfer trasero —que daría el tamaño de la
 ventana, con bandas negras, zoom y la interfaz encima—. Un recorte abre el
 archivo por segunda vez en vez de mover el demultiplexor de la reproducción.
 
-El recorte copia paquetes sin decodificar. Es lo correcto (instantáneo y sin
-pérdida) y además lo único posible: el binario se compila sin codificadores
-H.264/HEVC. La contrapartida es el alineamiento al fotograma clave, que se
-informa al usuario en lugar de disimularlo.
+El recorte tiene **dos implementaciones** y la elección la hace `StartTrim`:
+
+- `media/Trimmer` — copia de paquetes. Instantáneo y sin pérdida, pero alineado
+  al fotograma clave y sin poder aplicar nada.
+- `render/ClipExporter` — decodifica, redibuja con `VideoRenderer` y recodifica.
+  Frame-exacto y con encuadre y ajustes aplicados, a cambio de tiempo.
+
+El exportador vive en `render/` y no en `media/` porque necesita el
+renderizador, y la regla de dependencias permite `render → media` pero no al
+revés. Abre su **propio** demultiplexor, decodificador y renderizador; solo
+comparte el `ID3D11Device`, que es lo que mantiene el zero-copy hasta el shader.
+Exportar mientras se ve el vídeo no debe mover el cabezal ni robarle las vistas
+cacheadas al renderizador de pantalla.
+
+El codificador es `h264_mf` / `hevc_mf`: envoltorios de FFmpeg sobre Media
+Foundation, que ya viene con Windows. **No se consultan capacidades, se prueba
+abriendo**: qué combinación de resolución, cadencia y tasa acepta cada
+codificador depende de la GPU y del controlador. El HEVC de la máquina de
+desarrollo rechaza con `MF_E_INVALIDMEDIATYPE` el mismo 5172x2892 que el de
+H.264 acepta sin pestañear.
 
 Ambas operaciones corren fuera del hilo de interfaz: la captura en el de
 presentación (dueño del fotograma y del renderizador, y por eso inicializa COM,

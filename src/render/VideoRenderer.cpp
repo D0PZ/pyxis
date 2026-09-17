@@ -663,14 +663,19 @@ ComPtr<ID3D11Texture2D> VideoRenderer::RenderToTexture(const VideoFrame& frame,
     PYXIS_CHECK_HR(device_->Handle()->CreateRenderTargetView(result.Get(), nullptr, &target),
                    "no se pudo crear el destino de render de la captura");
 
-    const BoundFrame bound = BindFrame(frame);
-    if (!bound.Valid()) {
-        result.Reset();
-        return result;
-    }
+    RenderToTarget(target.Get(), width, height, frame);
+    return result;
+}
 
-    // Salida SDR y sin ajustes de encuadre: una captura debe reflejar el
-    // fotograma, no como estaba encuadrado en la ventana en ese momento.
+void VideoRenderer::RenderToTarget(ID3D11RenderTargetView* target, unsigned width,
+                                   unsigned height, const VideoFrame& frame) {
+    if (target == nullptr || !frame.IsValid()) return;
+
+    const BoundFrame bound = BindFrame(frame);
+    if (!bound.Valid()) return;
+
+    // Salida SDR y sin encuadre de ventana: lo que se exporta es el fotograma,
+    // no como estaba colocado dentro de la ventana en ese momento.
     Constants constants{};
     FillConstants(constants, frame, bound.textureWidth, bound.textureHeight, false);
     constants.bitScale = BitScaleFor(frame.color, bound.lumaFormat);
@@ -680,14 +685,12 @@ ComPtr<ID3D11Texture2D> VideoRenderer::RenderToTexture(const VideoFrame& frame,
     viewport.Height   = static_cast<float>(height);
     viewport.MaxDepth = 1.0f;
 
-    IssueDraw(target.Get(), viewport, bound, constants);
+    IssueDraw(target, viewport, bound, constants);
 
     // El estado del contexto queda apuntando a esta textura; se desenlaza para
     // que el siguiente fotograma en pantalla no herede el destino equivocado.
     ID3D11RenderTargetView* none[1] = {nullptr};
     device_->Context()->OMSetRenderTargets(1, none, nullptr);
-
-    return result;
 }
 
 void VideoRenderer::Destroy() noexcept {

@@ -99,6 +99,7 @@ set(PYXIS_SOURCES
     src/render/VideoRenderer.cpp
     src/render/Overlay.cpp
     src/render/Snapshot.cpp
+    src/render/ClipExporter.cpp
 
     src/audio/WasapiRenderer.cpp
 

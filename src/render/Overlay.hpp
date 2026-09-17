@@ -147,7 +147,8 @@ struct OverlayModel {
     // Recorte: puntos A y B sobre la barra. kNoTimestamp = sin marcar.
     Micros trimStart = kNoTimestamp;
     Micros trimEnd   = kNoTimestamp;
-    bool   trimBusy  = false;   // exportacion en curso
+    bool   trimBusy     = false;   // exportacion en curso
+    int    trimProgress = -1;      // 0 a 100, o -1 si no aplica
 
     // Encuadre. Mientras `cropEditing` esta activo el video se muestra COMPLETO
     // y el rectangulo se dibuja encima con el exterior atenuado: recortar en

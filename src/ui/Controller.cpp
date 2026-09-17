@@ -5,6 +5,7 @@
 #include "core/Text.hpp"
 #include "core/Thread.hpp"
 #include "media/Trimmer.hpp"
+#include "render/ClipExporter.hpp"
 #include "render/Snapshot.hpp"
 
 #include <shobjidl.h>
@@ -75,7 +76,9 @@ Controller::~Controller() {
     StopPresentation();
 
     // La exportacion referencia a este objeto; soltarla sin esperar seria un
-    // uso despues de destruir.
+    // uso despues de destruir. Se le pide que pare para no tener que aguantar
+    // una recodificacion entera al cerrar.
+    trimCancel_.store(true, std::memory_order_release);
     if (trimThread_.joinable()) trimThread_.join();
     // El fotograma en pantalla referencia una textura del pool del
     // decodificador: hay que soltarlo antes de cerrar el reproductor.
@@ -530,7 +533,8 @@ void Controller::BuildOverlayModel(OverlayModel& model) {
 
     model.trimStart = trimStart_.load(std::memory_order_relaxed);
     model.trimEnd   = trimEnd_.load(std::memory_order_relaxed);
-    model.trimBusy  = trimBusy_.load(std::memory_order_relaxed);
+    model.trimBusy     = trimBusy_.load(std::memory_order_relaxed);
+    model.trimProgress = trimProgress_.load(std::memory_order_relaxed);
 
     model.speedMenuOpen      = speedMenuOpen_.load(std::memory_order_relaxed);
     model.speedMenuHighlight = speedMenuHighlight_.load(std::memory_order_relaxed);
@@ -796,54 +800,89 @@ void Controller::StartTrim() {
     }
     if (currentPath_.empty()) return;
 
-    // El recorte temporal copia el flujo tal cual, asi que NO puede llevarse el
-    // encuadre ni los ajustes de imagen: eso exigiria decodificar y volver a
-    // codificar. Antes que entregar en silencio un archivo que no es el que se
-    // ve en pantalla, se avisa.
-    bool hasEdits = false;
+    // Dos caminos, y la diferencia la marca si hay pixeles que tocar:
+    //
+    //   sin ediciones -> copia de flujo: instantanea y sin perdida.
+    //   con ediciones -> recodificacion: hay que redibujar cada fotograma.
+    CropRect         crop{};
+    ImageAdjustments adjustments{};
     {
         std::lock_guard<std::mutex> lock(viewMutex_);
-        hasEdits = !crop_.IsFull() || !adjustments_.IsNeutral();
+        crop        = crop_;
+        adjustments = adjustments_;
     }
-    if (hasEdits) {
-        ShowToast(L"Aviso: el recorte conserva el vídeo original, "
-                  L"sin el encuadre ni los ajustes");
-    }
+    const bool hasEdits = !crop.IsFull() || !adjustments.IsNeutral();
 
     // Solo puede haber una exportacion a la vez, y el hilo anterior tiene que
     // estar recogido antes de lanzar otro.
     if (trimThread_.joinable()) trimThread_.join();
 
+    trimCancel_.store(false, std::memory_order_release);
     trimBusy_.store(true, std::memory_order_release);
-    ShowToast(L"Recortando...");
+    trimProgress_.store(hasEdits ? 0 : -1, std::memory_order_relaxed);
+
+    ShowToast(hasEdits ? L"Recortando con encuadre y ajustes..." : L"Recortando...");
 
     const std::wstring source = currentPath_;
 
-    trimThread_ = std::thread([this, source, start, end] {
+    trimThread_ = std::thread([this, source, start, end, hasEdits, crop, adjustments] {
         SetCurrentThreadName(L"pyxis-recorte");
 
         const std::wstring destination = BuildClipPath(source, start, end);
-        const TrimResult result = TrimToFile(source, destination, start, end);
 
-        if (result.ok) {
-            std::wstring message =
-                L"Recorte guardado  " +
-                std::filesystem::path(result.path).filename().wstring();
+        if (hasEdits) {
+            ClipExportRequest request;
+            request.inputPath   = source;
+            request.outputPath  = destination;
+            request.start       = start;
+            request.end         = end;
+            request.crop        = crop;
+            request.adjustments = adjustments;
 
-            // El corte de entrada se alinea al fotograma clave anterior. Si la
-            // diferencia se nota, se dice: mas vale saberlo que descubrirlo al
-            // abrir el archivo.
-            if (result.actualStart != kNoTimestamp && start - result.actualStart > 100000) {
-                const long long earlier = (start - result.actualStart) / 100;
-                message += L"  (empieza " + std::to_wstring(earlier / 10) + L"." +
-                           std::to_wstring(earlier % 10) + L" s antes, en el fotograma clave)";
+            const ClipExportResult exported = ExportClip(
+                device_, request,
+                [this](int percent) {
+                    trimProgress_.store(percent, std::memory_order_relaxed);
+                },
+                trimCancel_);
+
+            if (exported.ok) {
+                std::array<wchar_t, 160> message{};
+                std::swprintf(message.data(), message.size(),
+                              L"Recorte guardado  %s  (%d x %d)",
+                              std::filesystem::path(exported.path).filename().wstring().c_str(),
+                              exported.width, exported.height);
+                ShowToast(message.data());
+            } else if (exported.error != "cancelado") {
+                PYXIS_ERROR("la exportacion fallo: {}", exported.error);
+                ShowToast(L"No se pudo exportar: " + ToUtf16(exported.error));
             }
-            ShowToast(message);
         } else {
-            PYXIS_ERROR("el recorte fallo: {}", result.error);
-            ShowToast(L"No se pudo recortar: " + ToUtf16(result.error));
+            const TrimResult result = TrimToFile(source, destination, start, end);
+
+            if (result.ok) {
+                std::wstring message =
+                    L"Recorte guardado  " +
+                    std::filesystem::path(result.path).filename().wstring();
+
+                // El corte de entrada se alinea al fotograma clave anterior. Si
+                // la diferencia se nota, se dice: mas vale saberlo que
+                // descubrirlo al abrir el archivo.
+                if (result.actualStart != kNoTimestamp &&
+                    start - result.actualStart > 100000) {
+                    const long long earlier = (start - result.actualStart) / 100;
+                    message += L"  (empieza " + std::to_wstring(earlier / 10) + L"." +
+                               std::to_wstring(earlier % 10) +
+                               L" s antes, en el fotograma clave)";
+                }
+                ShowToast(message);
+            } else {
+                PYXIS_ERROR("el recorte fallo: {}", result.error);
+                ShowToast(L"No se pudo recortar: " + ToUtf16(result.error));
+            }
         }
 
+        trimProgress_.store(-1, std::memory_order_relaxed);
         trimBusy_.store(false, std::memory_order_release);
     });
 }

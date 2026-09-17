@@ -187,6 +187,8 @@ private:
     std::atomic<Micros> trimStart_{kNoTimestamp};
     std::atomic<Micros> trimEnd_{kNoTimestamp};
     std::atomic<bool>   trimBusy_{false};
+    std::atomic<int>    trimProgress_{-1};
+    std::atomic<bool>   trimCancel_{false};
     std::thread         trimThread_;
 
     // Que tirador de recorte se esta arrastrando: 0 ninguno, -1 el inicio,

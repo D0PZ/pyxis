@@ -161,18 +161,34 @@ Marca el inicio con `A` y el final con `B`; el intervalo aparece sombreado en
 **tijera** a la derecha exporta la selección; el clic derecho sobre ella la
 descarta, igual que la tecla `C`.
 
-El recorte se guarda en `Vídeos\Pyxis` con el mismo contenedor que el original.
+El recorte se guarda en `Vídeos\Pyxis`. Hay **dos caminos**, y Pyxis elige según
+lo que haya que entregar.
 
-**Se copia el flujo, no se recodifica.** Los paquetes pasan tal cual del archivo
-de origen al nuevo, con tres consecuencias: es casi instantáneo (20 s de 8K a
-150 Mbit/s son unos 360 MB movidos de disco a disco), no hay ninguna pérdida de
-calidad, y **el corte de entrada se alinea al fotograma clave anterior**.
+**Sin ediciones: copia de flujo.** Los paquetes pasan tal cual del archivo de
+origen al nuevo. Es casi instantáneo —20 s de 8K a 150 Mbit/s son unos 360 MB
+movidos de disco a disco—, no hay ninguna pérdida, y **el corte de entrada se
+alinea al fotograma clave anterior**. Eso último no es un atajo: un códec
+inter-fotograma no puede arrancar a mitad de un grupo de imágenes. Cuando el
+desfase se nota, Pyxis lo dice en el aviso.
 
-Eso último no es un atajo: un códec inter-fotograma no puede arrancar a mitad de
-un grupo de imágenes. Cortar exactamente en el fotograma pedido exigiría
-recodificar, y este binario no lleva codificadores H.264/HEVC a propósito —son
-los que arrastran dependencias y patentes—. Cuando el desfase se nota, Pyxis lo
-dice en el aviso.
+**Con encuadre o ajustes: recodificación.** Cada fotograma se decodifica, se
+redibuja con el shader —el mismo que estás viendo, así que el resultado es
+exactamente lo que había en pantalla— y se codifica. El corte es entonces
+frame-exacto, no alineado al fotograma clave. La tijera se convierte en un
+anillo de progreso, y cerrar la ventana cancela la exportación en curso.
+
+El codificador es el de **Windows** (`h264_mf` / `hevc_mf`, sobre Media
+Foundation), que usa el motor de vídeo de la GPU. Enlazar libx264 habría sido lo
+habitual, pero rompe la regla de cero dependencias: Media Foundation ya viene
+con el sistema, igual que D3D11 o WASAPI.
+
+Se prefiere H.264 por compatibilidad y HEVC cuando la salida pasa de 4096 px,
+pero **se comprueba abriéndolo**: qué combinación de resolución, cadencia y tasa
+acepta cada codificador depende de la GPU y del controlador, y no hay forma
+fiable de preguntarlo por adelantado. Si el preferido rechaza, se usa el otro.
+
+La salida es de 8 bits en SDR. Si el original era HDR de 10 bits, lo que se graba
+es el mapeo de tonos que el shader ya hacía para mostrarlo.
 
 ### Encuadre
 
@@ -204,11 +220,6 @@ La exposición se aplica en **luz lineal** y el resto en dominio de display. No
 es un detalle menor: un paso de diafragma es una duplicación de la luz que
 entra, y eso solo es cierto antes de la curva de gamma; aplicarla sobre el valor
 codificado aclararía las sombras mucho más de lo que haría una cámara.
-
-> **El recorte temporal no se lleva el encuadre ni los ajustes.** Copia el flujo
-> sin recodificar, y aplicar una transformación de imagen exige decodificar y
-> volver a codificar. Pyxis avisa al exportar con ediciones activas en lugar de
-> entregar en silencio un archivo distinto del que se ve.
 
 ### Zoom
 
