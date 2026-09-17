@@ -15,16 +15,15 @@ concurrency:
 
 env:
   VCPKG_DISABLE_METRICS: 1
+  # Cache binaria de vcpkg sobre el almacen de Actions. Sin esto, cada
+  # ejecucion recompila FFmpeg desde fuente y tarda entre ocho y quince
+  # minutos; con esto, las siguientes se lo descargan ya compilado.
+  VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
 
 jobs:
   build:
-    name: Compilar (${{ matrix.configuration }})
+    name: Compilar y auditar dependencias
     runs-on: windows-2025
-
-    strategy:
-      fail-fast: false
-      matrix:
-        configuration: [release, debug]
 
     steps:
       - name: Obtener el codigo
@@ -38,32 +37,40 @@ jobs:
       - name: Instalar Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
 
+      # run-vcpkg lee el commit de vcpkg.json ("builtin-baseline") y clona esa
+      # revision exacta. Sin baseline aborta antes de empezar, que es lo que
+      # hacia fallar este flujo de trabajo desde el primer dia.
+      - name: Exponer el almacen de cache a vcpkg
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Preparar vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          # La cache binaria de vcpkg convierte los 30 minutos de FFmpeg en
-          # segundos a partir de la segunda ejecucion.
           runVcpkgInstall: false
+          vcpkgJsonGlob: 'vcpkg.json'
 
       - name: Configurar
-        run: cmake --preset ${{ matrix.configuration }}
-        env:
-          VCPKG_ROOT: ${{ env.VCPKG_ROOT }}
+        run: cmake --preset release
 
       - name: Compilar
-        run: cmake --build --preset ${{ matrix.configuration }}
+        run: cmake --build --preset release
 
+      # El binario autocontenido es la propiedad que define el proyecto. Si
+      # aparece una DLL que no venga con Windows, la compilacion debe fallar:
+      # es mucho mas facil detectarlo aqui que cuando a alguien no le arranca.
       - name: Comprobar que el binario es autocontenido
         shell: pwsh
         run: |
-          $exe = "build/${{ matrix.configuration }}/bin/pyxis.exe"
+          $exe = 'build/release/bin/pyxis.exe'
           if (-not (Test-Path $exe)) { throw "No se genero $exe" }
 
           $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
           Write-Host "pyxis.exe: $size MB"
 
-          # La razon de ser del proyecto es que no dependa de nada: si aparece
-          # una DLL de terceros entre las importaciones, el CI debe fallar.
           $imports = (& dumpbin /DEPENDENTS $exe) -split "`n" |
                      Where-Object { $_ -match '\.dll\s*$' } |
                      ForEach-Object { $_.Trim().ToLower() }
@@ -73,22 +80,37 @@ jobs:
             'oleaut32.dll','advapi32.dll','shcore.dll','comdlg32.dll','dwmapi.dll',
             'd3d11.dll','dxgi.dll','d2d1.dll','dwrite.dll','avrt.dll','winmm.dll',
             'mf.dll','mfplat.dll','mfreadwrite.dll','propsys.dll','bcrypt.dll',
-            'secur32.dll','ws2_32.dll','version.dll','psapi.dll','userenv.dll',
-            'crypt32.dll','ntdll.dll','api-ms-win-core-synch-l1-2-0.dll'
+            'secur32.dll','ncrypt.dll','crypt32.dll','ws2_32.dll','version.dll',
+            'psapi.dll','userenv.dll','ntdll.dll','windowscodecs.dll'
           )
 
           $unexpected = $imports | Where-Object {
             $_ -notin $allowed -and $_ -notlike 'api-ms-win-*'
           }
 
+          Write-Host "Dependencias: $($imports -join ', ')"
+
           if ($unexpected) {
-            Write-Host "::error::Dependencias inesperadas: $($unexpected -join ', ')"
+            Write-Host "::error::Dependencias ajenas al sistema: $($unexpected -join ', ')"
             exit 1
           }
-          Write-Host "Solo depende de componentes del sistema."
+          Write-Host "Solo depende de componentes de Windows."
+
+      # Los shaders se compilan en tiempo de construccion, asi que un error de
+      # HLSL ya habria roto el paso anterior. Esto verifica que el bytecode
+      # acabo dentro del binario y no en un archivo suelto olvidado.
+      - name: Comprobar que no hay artefactos sueltos
+        shell: pwsh
+        run: |
+          $stray = Get-ChildItem 'build/release/bin' -File |
+                   Where-Object { $_.Extension -notin '.exe', '.pdb' }
+          if ($stray) {
+            Write-Host "::error::Archivos inesperados junto al ejecutable: $($stray.Name -join ', ')"
+            exit 1
+          }
+          Write-Host "El directorio de salida solo contiene el ejecutable."
 
       - name: Publicar el binario
-        if: matrix.configuration == 'release'
         uses: actions/upload-artifact@v4
         with:
           name: pyxis-windows-x64

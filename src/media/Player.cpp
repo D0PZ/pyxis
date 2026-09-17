@@ -46,6 +46,10 @@ constexpr std::size_t kHistoryMaxFrames   = 48;
 // pena: a partir de aqui se prefiere rebobinar mas veces.
 constexpr Micros kMaxRewindWindow = 2 * kMicrosPerSecond;
 
+// Espera entre intentos de reabrir el audio. Un dispositivo que no vuelve no
+// debe provocar sesenta reaperturas por segundo.
+constexpr Micros kAudioRecoveryInterval = 2 * kMicrosPerSecond;
+
 // Memoria de video libre, en bytes. Devuelve cero si no se puede averiguar, y
 // entonces se cae al minimo.
 [[nodiscard]] std::size_t AvailableVideoMemory(ID3D11Device* device) noexcept {
@@ -481,7 +485,71 @@ void Player::AudioDecodeThread() {
 // ---------------------------------------------------------------------------
 //  Seleccion del fotograma a presentar
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  Recuperacion de la salida de audio
+//
+//  Windows invalida el flujo cuando el dispositivo predeterminado cambia: al
+//  conectar unos auriculares, al desconectarlos, al apagar un monitor con
+//  altavoces. No es un error: es lo normal en un portatil.
+//
+//  Sin esto, el audio moria en silencio y no volvia hasta reabrir el archivo.
+//  Reabrir implica renegociar el formato -el dispositivo nuevo puede tener otra
+//  frecuencia- y por eso hay que rehacer tambien el remuestreador, que es lo que
+//  traduce del formato del codec al del dispositivo.
+// ---------------------------------------------------------------------------
+void Player::RecoverAudioDevice() {
+    if (!HasAudio() || !audio_.DeviceLost()) return;
+
+    const Micros now = NowMicros();
+    if (now - lastAudioRecoveryAt_ < kAudioRecoveryInterval) return;
+    lastAudioRecoveryAt_ = now;
+
+    PYXIS_WARN("el dispositivo de audio cambio; reabriendo");
+
+    // El hilo de decodificacion de audio se para antes de tocar nada: va a
+    // quedarse sin remuestreador bajo los pies.
+    audioPackets_.Close();
+    if (audioThread_.joinable()) audioThread_.join();
+    audioPackets_.Reopen();
+
+    audio_.Close();
+    audioDecoder_.Close();
+
+    try {
+        audio_.Open();
+
+        AudioDecoder::Config config;
+        config.sampleRate = audio_.GetFormat().sampleRate;
+        config.channels   = audio_.GetFormat().channels;
+        audioDecoder_.Open(demuxer_.Audio(), config);
+
+    } catch (const Exception& error) {
+        // Puede no haber ningun dispositivo todavia -el usuario acaba de
+        // desconectar el unico que habia-. Se sigue sin sonido y se reintenta
+        // mas tarde; perder la imagen ademas del audio seria mucho peor.
+        PYXIS_WARN("el audio sigue sin estar disponible: {}", error.what());
+        audio_.Close();
+        return;
+    }
+
+    audioThread_ = std::thread([this] { AudioDecodeThread(); });
+    audio_.Start(clock_);
+    audio_.SetPaused(state_.load(std::memory_order_acquire) != PlayerState::Playing);
+
+    // El reloj lo gobierna el audio, y el dispositivo nuevo arranca vacio. Un
+    // salto a la posicion actual rellena las colas desde donde toca en lugar de
+    // dejar que el video corra solo hasta que el sonido le alcance.
+    RequestSeekInternal(Position());
+
+    PYXIS_INFO("Audio restablecido: {} Hz, {} canales",
+               audio_.GetFormat().sampleRate, audio_.GetFormat().channels);
+}
+
 Player::FrameSelection Player::SelectFrame(VideoFrame& out) {
+    // El hilo de presentacion es el unico que pasa por aqui sin depender de que
+    // el audio siga vivo, asi que es quien detecta que hay que reabrirlo.
+    RecoverAudioDevice();
+
     // La generacion es tambien como este hilo se entera de que el fotograma que
     // tenia reservado pertenece a otra posicion, o a otro medio. Se comprueba
     // ANTES que nada para que cerrar un archivo libere la reserva aunque ya no

@@ -208,6 +208,11 @@ private:
     void VideoDecodeThread();
     void AudioDecodeThread();
 
+    // Reabre la salida de audio cuando Windows invalida el dispositivo. Lo
+    // llama el hilo de presentacion, que es quien pasa por aqui con regularidad
+    // sin estar atado a que el audio siga vivo.
+    void RecoverAudioDevice();
+
     void RequestSeekInternal(Micros target);
     void SetFailed(const std::string& message);
 
@@ -284,6 +289,10 @@ private:
     // encolado pertenecia a donde se pauso, no a donde se ha llegado pasando
     // fotogramas.
     std::atomic<bool> steppingMode_{false};
+
+    // Momento del ultimo intento de reabrir el audio. Sin esta pausa, un
+    // dispositivo que no vuelve haria reintentar sesenta veces por segundo.
+    Micros lastAudioRecoveryAt_ = 0;
 
     // Fotograma ya extraido de la cola pero cuyo momento aun no ha llegado.
     VideoFrame pendingFrame_;

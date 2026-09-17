@@ -5,6 +5,14 @@
   "description": "Reproductor de video de alto rendimiento para Windows 11 x64",
   "homepage": "https://github.com/D0PZ/pyxis",
   "license": "GPL-3.0-or-later",
+  "$comment-baseline": [
+    "Sin baseline, vcpkg resuelve los puertos contra el arbol que cada uno",
+    "tenga clonado: la version de FFmpeg depende de cuando actualizaste tu",
+    "copia. Fijarlo hace la compilacion reproducible y es ademas lo que exige",
+    "run-vcpkg en integracion continua, que sin esto aborta antes de empezar.",
+    "Para actualizar: cambia el commit y recompila con -Clean."
+  ],
+  "builtin-baseline": "9e44ec0e9f247d77c230ced0ee66c76296837807",
   "dependencies": [
     {
       "name": "ffmpeg",
