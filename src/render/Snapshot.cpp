@@ -2,10 +2,9 @@
 
 #include "core/Error.hpp"
 #include "core/Log.hpp"
+#include "core/Paths.hpp"
 #include "core/Text.hpp"
 
-#include <knownfolders.h>
-#include <shlobj.h>
 #include <wincodec.h>
 
 #include <array>
@@ -13,56 +12,9 @@
 #include <filesystem>
 
 namespace pyxis {
-namespace {
-
-// SHGetKnownFolderPath reserva con CoTaskMemAlloc.
-struct CoTaskMemDeleter {
-    void operator()(void* p) const noexcept { ::CoTaskMemFree(p); }
-};
-
-[[nodiscard]] std::wstring PicturesFolder() {
-    PWSTR raw = nullptr;
-    if (FAILED(::SHGetKnownFolderPath(FOLDERID_Pictures, 0, nullptr, &raw))) {
-        return {};
-    }
-    const std::unique_ptr<wchar_t, CoTaskMemDeleter> owned(raw);
-    return std::wstring(owned.get());
-}
-
-// Quita los caracteres que Windows no admite en un nombre de archivo. El titulo
-// viene del nombre del medio, que ya es un nombre valido, pero una URL no.
-[[nodiscard]] std::wstring SanitizeName(std::wstring_view name) {
-    static constexpr std::wstring_view kForbidden = L"\\/:*?\"<>|";
-
-    std::wstring clean;
-    clean.reserve(name.size());
-    for (const wchar_t character : name) {
-        clean.push_back(kForbidden.find(character) == std::wstring_view::npos &&
-                                character >= 0x20
-                            ? character
-                            : L'_');
-    }
-    while (!clean.empty() && (clean.back() == L' ' || clean.back() == L'.')) {
-        clean.pop_back();
-    }
-    return clean.empty() ? std::wstring(L"captura") : clean;
-}
-
-}  // namespace
 
 std::wstring BuildSnapshotPath(const std::wstring& mediaTitle, Micros position) {
-    std::filesystem::path folder = PicturesFolder();
-    if (folder.empty()) folder = std::filesystem::current_path();
-    folder /= L"Pyxis";
-
-    std::error_code error;
-    std::filesystem::create_directories(folder, error);
-    if (error) {
-        // Si no se puede crear la carpeta se cae al directorio actual antes que
-        // renunciar a la captura.
-        PYXIS_WARN("no se pudo crear '{}': {}", folder.string(), error.message());
-        folder = std::filesystem::current_path();
-    }
+    std::filesystem::path folder = PyxisOutputFolder(UserFolder::Pictures);
 
     // Se recorta la extension del medio para no acabar con "pelicula.mkv_...png".
     std::wstring stem = std::filesystem::path(mediaTitle).stem().wstring();
@@ -76,7 +28,7 @@ std::wstring BuildSnapshotPath(const std::wstring& mediaTitle, Micros position) 
                   totalMs / 3600000, (totalMs / 60000) % 60, (totalMs / 1000) % 60,
                   totalMs % 1000);
 
-    folder /= SanitizeName(stem) + stamp.data();
+    folder /= SanitizeFileName(stem) + stamp.data();
     return folder.wstring();
 }
 

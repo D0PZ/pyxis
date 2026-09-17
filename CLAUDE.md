@@ -64,6 +64,7 @@ src/
 │   ├── Clock.hpp       tiempo monótono + MediaClock (el reloj maestro)
 │   ├── Queue.hpp       cola acotada y bloqueante entre etapas
 │   ├── Thread.hpp      MMCSS y nombrado de hilos
+│   ├── Paths.hpp       carpetas de salida y nombres de archivo
 │   └── Text.hpp        la única frontera UTF-8 / UTF-16
 │
 ├── media/              el pipeline
@@ -72,6 +73,7 @@ src/
 │   ├── Demuxer.hpp     apertura de contenedores (componente pasivo)
 │   ├── VideoDecoder.hpp   D3D11VA + repliegue por software
 │   ├── AudioDecoder.hpp   decodificación + remuestreo
+│   ├── Trimmer.hpp     recorte A/B por copia de flujo
 │   └── Player.hpp      orquestación: hilos, saltos, sincronía
 │
 ├── render/
@@ -79,6 +81,7 @@ src/
 │   ├── SwapChain.hpp   DXGI modo flip, HDR, VRR
 │   ├── VideoRenderer.hpp  dibuja el fotograma; caché de vistas
 │   ├── Overlay.hpp     interfaz con Direct2D sobre textura intermedia
+│   ├── Snapshot.hpp    captura del fotograma a PNG (WIC)
 │   └── shaders/
 │       ├── color.hlsli     transferencias y matrices de gama
 │       ├── fullscreen.hlsl vertex shader del triángulo completo
@@ -232,6 +235,24 @@ variable dos fotogramas consecutivos pueden distar 33 ms o 266 ms, así que
 «posición menos una duración» no identifica al anterior. Los límites se
 expresan como comparaciones: *el último que hay antes del actual*.
 
+## Exportar: capturas y recortes
+
+Las dos salidas comparten un principio: **no reutilizan el pipeline de
+reproducción**. Una captura redibuja el fotograma a resolución nativa en su
+propia textura en vez de copiar el búfer trasero —que daría el tamaño de la
+ventana, con bandas negras, zoom y la interfaz encima—. Un recorte abre el
+archivo por segunda vez en vez de mover el demultiplexor de la reproducción.
+
+El recorte copia paquetes sin decodificar. Es lo correcto (instantáneo y sin
+pérdida) y además lo único posible: el binario se compila sin codificadores
+H.264/HEVC. La contrapartida es el alineamiento al fotograma clave, que se
+informa al usuario en lugar de disimularlo.
+
+Ambas operaciones corren fuera del hilo de interfaz: la captura en el de
+presentación (dueño del fotograma y del renderizador, y por eso inicializa COM,
+que WIC necesita) y el recorte en un hilo propio que el `Controller` recoge en
+su destructor.
+
 ## Trampas conocidas
 
 - **`D3D11_BIND_SHADER_RESOURCE` en el pool de D3D11VA.** Se añade en
@@ -365,5 +386,9 @@ primera herramienta a mirar** ante cualquier problema de fluidez:
 - **Nuevo control en la barra** → dibujo en `Overlay::DrawControlBar` (o un
   `Draw*` propio), prueba de impacto como `HitTestSpeed`, y reparto del clic en
   `Controller::OnLeftButtonDown`. El orden de ese reparto importa: el menú
-  desplegado se queda con el clic antes que nadie, y la barra de progreso va la
+  desplegado se queda con el clic antes que nadie, los tiradores del recorte van
+  antes que la barra de progreso porque están encima de ella, y la barra va la
   última porque ocupa casi todo el ancho.
+- **Nueva carpeta de salida** → `core/Paths.hpp`. No repitas la resolución de
+  carpetas conocidas ni el saneado del nombre: las dos salidas que ya existen
+  pasan por ahí precisamente para no divergir.

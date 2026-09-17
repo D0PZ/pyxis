@@ -4,6 +4,7 @@
 #include "core/Log.hpp"
 #include "core/Text.hpp"
 #include "core/Thread.hpp"
+#include "media/Trimmer.hpp"
 #include "render/Snapshot.hpp"
 
 #include <shobjidl.h>
@@ -72,6 +73,10 @@ std::wstring FormatDuration(Micros micros) {
 
 Controller::~Controller() {
     StopPresentation();
+
+    // La exportacion referencia a este objeto; soltarla sin esperar seria un
+    // uso despues de destruir.
+    if (trimThread_.joinable()) trimThread_.join();
     // El fotograma en pantalla referencia una textura del pool del
     // decodificador: hay que soltarlo antes de cerrar el reproductor.
     currentFrame_ = VideoFrame{};
@@ -496,13 +501,20 @@ void Controller::BuildOverlayModel(OverlayModel& model) {
     // que controlar y una ventana negra no explica nada.
     model.showWelcome = player_.State() == PlayerState::Idle;
     model.showStats   = showStats_.load(std::memory_order_relaxed) && !model.showWelcome;
+    model.trimStart = trimStart_.load(std::memory_order_relaxed);
+    model.trimEnd   = trimEnd_.load(std::memory_order_relaxed);
+    model.trimBusy  = trimBusy_.load(std::memory_order_relaxed);
+
     model.speedMenuOpen      = speedMenuOpen_.load(std::memory_order_relaxed);
     model.speedMenuHighlight = speedMenuHighlight_.load(std::memory_order_relaxed);
 
     // Los controles permanecen visibles si esta en pausa: ocultar la barra en
     // pausa obliga a mover el raton para saber donde se quedo la reproduccion.
+    const bool trimPinned = model.trimBusy || model.trimStart != kNoTimestamp ||
+                            model.trimEnd != kNoTimestamp;
+
     model.showControls = !model.showWelcome &&
-                         (model.paused || model.speedMenuOpen ||
+                         (model.paused || model.speedMenuOpen || trimPinned ||
                           (now - lastActivity) < kControlsHideDelay);
 
     {
@@ -591,6 +603,98 @@ void Controller::ApplySpeedIndex(int index) {
 
     player_.SetRateMilli(kPlaybackRates[static_cast<std::size_t>(index)]);
     NoteUserActivity();
+}
+
+// ---------------------------------------------------------------------------
+//  Recorte
+// ---------------------------------------------------------------------------
+Micros Controller::SeekBarPositionAt(int x, int y) const {
+    return overlay_.HitTestSeekBar(x, y);
+}
+
+void Controller::SetTrimPoint(bool isStart) {
+    if (!player_.HasVideo()) return;
+
+    const Micros position = player_.Position();
+
+    if (isStart) {
+        trimStart_.store(position, std::memory_order_relaxed);
+
+        // Marcar un inicio posterior al final invalidaria el intervalo. En vez
+        // de rechazar la accion se suelta el final, que es lo que el usuario
+        // esta a punto de volver a marcar.
+        const Micros end = trimEnd_.load(std::memory_order_relaxed);
+        if (end != kNoTimestamp && end <= position) {
+            trimEnd_.store(kNoTimestamp, std::memory_order_relaxed);
+        }
+        ShowToast(L"Inicio del recorte marcado");
+    } else {
+        const Micros start = trimStart_.load(std::memory_order_relaxed);
+        if (start != kNoTimestamp && position <= start) {
+            ShowToast(L"El final debe ir después del inicio");
+            return;
+        }
+        trimEnd_.store(position, std::memory_order_relaxed);
+        ShowToast(L"Final del recorte marcado");
+    }
+
+    NoteUserActivity();
+}
+
+void Controller::ClearTrim() {
+    trimStart_.store(kNoTimestamp, std::memory_order_relaxed);
+    trimEnd_.store(kNoTimestamp, std::memory_order_relaxed);
+    NoteUserActivity();
+}
+
+void Controller::StartTrim() {
+    if (trimBusy_.load(std::memory_order_acquire)) return;
+
+    const Micros start = trimStart_.load(std::memory_order_relaxed);
+    const Micros end   = trimEnd_.load(std::memory_order_relaxed);
+
+    if (start == kNoTimestamp || end == kNoTimestamp || end <= start) {
+        ShowToast(L"Marca el inicio con A y el final con B");
+        return;
+    }
+    if (currentPath_.empty()) return;
+
+    // Solo puede haber una exportacion a la vez, y el hilo anterior tiene que
+    // estar recogido antes de lanzar otro.
+    if (trimThread_.joinable()) trimThread_.join();
+
+    trimBusy_.store(true, std::memory_order_release);
+    ShowToast(L"Recortando...");
+
+    const std::wstring source = currentPath_;
+
+    trimThread_ = std::thread([this, source, start, end] {
+        SetCurrentThreadName(L"pyxis-recorte");
+
+        const std::wstring destination = BuildClipPath(source, start, end);
+        const TrimResult result = TrimToFile(source, destination, start, end);
+
+        if (result.ok) {
+            std::wstring message =
+                L"Recorte guardado  " +
+                std::filesystem::path(result.path).filename().wstring();
+
+            // El corte de entrada se alinea al fotograma clave anterior. Si la
+            // diferencia se nota, se dice: mas vale saberlo que descubrirlo al
+            // abrir el archivo.
+            if (result.actualStart != kNoTimestamp && start - result.actualStart > 100000) {
+                const long long earlier = (start - result.actualStart) / 100;
+                message += L"  (empieza " + std::to_wstring(earlier / 10) + L"." +
+                           std::to_wstring(earlier % 10) + L" s antes, en el fotograma clave)";
+            }
+            ShowToast(message);
+        } else {
+            PYXIS_ERROR("el recorte fallo: {}", result.error);
+            ShowToast(L"No se pudo recortar: " + ToUtf16(result.error));
+        }
+
+        trimBusy_.store(false, std::memory_order_release);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +813,8 @@ void Controller::OnKeyDown(int virtualKey, bool shift, bool control, bool repeat
         case VK_ESCAPE:
             if (speedMenuOpen_.load(std::memory_order_relaxed)) {
                 speedMenuOpen_.store(false, std::memory_order_relaxed);
+        trimStart_.store(kNoTimestamp, std::memory_order_relaxed);
+        trimEnd_.store(kNoTimestamp, std::memory_order_relaxed);
                 break;
             }
             if (window_.IsFullscreen()) window_.SetFullscreen(false);
@@ -716,6 +822,17 @@ void Controller::OnKeyDown(int virtualKey, bool shift, bool control, bool repeat
 
         case 'S':
             RequestSnapshot();
+            break;
+
+        case 'A':
+            SetTrimPoint(true);
+            break;
+        case 'B':
+            SetTrimPoint(false);
+            break;
+        case 'C':
+            ClearTrim();
+            ShowToast(L"Recorte descartado");
             break;
 
         case 'I':
@@ -774,6 +891,7 @@ void Controller::OnFocusLost() {
     // en segundo plano.
     stepDirection_.store(0, std::memory_order_relaxed);
     leftButtonDown_ = false;
+    draggingTrim_   = 0;
     seeking_.store(false, std::memory_order_relaxed);
 }
 
@@ -788,6 +906,24 @@ void Controller::OnMouseMove(int x, int y) {
 
     // Arrastre de la barra de progreso: se busca en vivo para que el usuario
     // vea a donde va, en lugar de saltar solo al soltar.
+    if (draggingTrim_ != 0) {
+        const Micros target = SeekBarPositionAt(x, y);
+        if (target != kNoTimestamp) {
+            if (draggingTrim_ < 0) {
+                const Micros end = trimEnd_.load(std::memory_order_relaxed);
+                if (end == kNoTimestamp || target < end) {
+                    trimStart_.store(target, std::memory_order_relaxed);
+                }
+            } else {
+                const Micros begin = trimStart_.load(std::memory_order_relaxed);
+                if (begin == kNoTimestamp || target > begin) {
+                    trimEnd_.store(target, std::memory_order_relaxed);
+                }
+            }
+        }
+        return;
+    }
+
     if (seeking_.load(std::memory_order_relaxed)) {
         const Micros target = overlay_.HitTestSeekBar(x, y);
         if (target != kNoTimestamp) RequestScrubSeek(target, false);
@@ -858,6 +994,21 @@ void Controller::OnLeftButtonDown(int x, int y) {
         RequestSnapshot();
         return;
     }
+    if (overlay_.HitTestTrim(x, y)) {
+        StartTrim();
+        return;
+    }
+
+    // Los tiradores del recorte tienen prioridad sobre la barra de progreso:
+    // estan encima de ella y arrastrarlos no debe mover la reproduccion.
+    if (overlay_.HitTestTrimStart(x, y)) {
+        draggingTrim_ = -1;
+        return;
+    }
+    if (overlay_.HitTestTrimEnd(x, y)) {
+        draggingTrim_ = 1;
+        return;
+    }
 
     const Micros target = overlay_.HitTestSeekBar(x, y);
     if (target != kNoTimestamp) {
@@ -876,6 +1027,11 @@ void Controller::OnLeftButtonDown(int x, int y) {
 }
 
 void Controller::OnLeftButtonUp(int, int) {
+    if (draggingTrim_ != 0) {
+        draggingTrim_ = 0;
+        return;
+    }
+
     if (seeking_.exchange(false, std::memory_order_relaxed)) {
         // Al soltar SIEMPRE se emite el salto definitivo, aunque el limitador
         // de cadencia acabase de descartar uno: si no, la reproduccion se
@@ -923,6 +1079,14 @@ void Controller::OnRightButtonDown(int x, int y) {
         const bool open = !speedMenuOpen_.load(std::memory_order_relaxed);
         speedMenuOpen_.store(open, std::memory_order_relaxed);
         speedMenuHighlight_.store(-1, std::memory_order_relaxed);
+        return;
+    }
+
+    // Clic derecho sobre la tijera: descarta la seleccion. Es la accion opuesta
+    // a la del clic izquierdo y va en el mismo sitio, que es donde se busca.
+    if (overlay_.HitTestTrim(x, y)) {
+        ClearTrim();
+        ShowToast(L"Recorte descartado");
         return;
     }
 

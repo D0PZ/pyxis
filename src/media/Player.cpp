@@ -935,7 +935,9 @@ void Player::SetMuted(bool muted)    { audio_.SetMuted(muted); }
 void Player::SetRateMilli(int rateMilli) {
     // Fuera de este rango, el remuestreo del audio deja de ser inteligible y la
     // decodificacion no puede seguir el ritmo.
-    clock_.SetRateMilli(std::clamp(rateMilli, 250, 4000));
+    const int clamped = std::clamp(rateMilli, 250, 4000);
+    clock_.SetRateMilli(clamped);
+    PYXIS_INFO("Velocidad de reproduccion: x{}.{:03}", clamped / 1000, clamped % 1000);
 }
 
 Micros Player::Position() const noexcept {

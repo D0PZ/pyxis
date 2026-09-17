@@ -53,6 +53,7 @@ suelto que se copia a un pendrive y funciona.
 | **Audio** | WASAPI dirigido por eventos con prioridad MMCSS «Pro Audio» |
 | **Sincronía** | Reloj maestro de audio; el vídeo descarta o repite fotogramas para seguirlo |
 | **Interfaz** | Direct2D sobre textura intermedia, repintada solo cuando cambia |
+| **Herramientas** | avance fotograma a fotograma, zoom anclado al puntero, captura PNG a resolución nativa, recorte A/B sin recodificar |
 
 ## Requisitos
 
@@ -107,6 +108,8 @@ velocidad con el botón de captura a la derecha.
 | `[` `]` | velocidad de reproducción |
 | `Retroceso` | velocidad normal |
 | `S` | guardar el fotograma como PNG |
+| `A` `B` | marcar el inicio y el final de un recorte |
+| `C` | descartar el recorte |
 | `I` | panel de estadísticas |
 | `O` | abrir archivo |
 | `Q` · `Esc` | salir |
@@ -147,6 +150,26 @@ resolución nativa: con el vídeo 8K de prueba el PNG sale a 7680×4320 aunque l
 ventana midiera 1280×720, sin bandas negras, sin el zoom aplicado y sin la
 interfaz encima. Si el material es HDR se mapea a SDR, que es lo que un PNG
 puede representar. La codificación usa WIC, que ya viene con Windows.
+
+### Recortar un fragmento
+
+Marca el inicio con `A` y el final con `B`; el intervalo aparece sombreado en
+ámbar sobre la barra, con dos tiradores que se pueden arrastrar para afinar. La
+**tijera** a la derecha exporta la selección; el clic derecho sobre ella la
+descarta, igual que la tecla `C`.
+
+El recorte se guarda en `Vídeos\Pyxis` con el mismo contenedor que el original.
+
+**Se copia el flujo, no se recodifica.** Los paquetes pasan tal cual del archivo
+de origen al nuevo, con tres consecuencias: es casi instantáneo (20 s de 8K a
+150 Mbit/s son unos 360 MB movidos de disco a disco), no hay ninguna pérdida de
+calidad, y **el corte de entrada se alinea al fotograma clave anterior**.
+
+Eso último no es un atajo: un códec inter-fotograma no puede arrancar a mitad de
+un grupo de imágenes. Cortar exactamente en el fotograma pedido exigiría
+recodificar, y este binario no lleva codificadores H.264/HEVC a propósito —son
+los que arrastran dependencias y patentes—. Cuando el desfase se nota, Pyxis lo
+dice en el aviso.
 
 ### Zoom
 

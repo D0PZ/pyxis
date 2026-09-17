@@ -35,6 +35,11 @@ constexpr float kButtonGap  = 6.0f;
 // Controles a la derecha.
 constexpr float kSpeedWidth     = 52.0f;
 constexpr float kSnapshotWidth  = 34.0f;
+constexpr float kTrimWidth      = 34.0f;
+
+// Tirador de los puntos de recorte. Mas ancho que su dibujo: acertar con el
+// raton sobre una linea de dos pixeles es imposible.
+constexpr float kTrimGrabWidth = 14.0f;
 constexpr float kControlGap     = 10.0f;
 constexpr float kControlHeight  = 28.0f;
 constexpr float kSpeedMenuItemH = 30.0f;
@@ -50,6 +55,12 @@ const std::array<std::wstring, kPlaybackRates.size()> kSpeedLabels = {
         if (kPlaybackRates[i] == rateMilli) return i;
     }
     return 3;   // 1x
+}
+
+// Ambar para el recorte. Se elige distinto del azul del progreso a proposito:
+// son dos cosas que conviven en la misma barra y confundirlas seria facil.
+[[nodiscard]] D2D1_COLOR_F TrimColor(float alpha) noexcept {
+    return D2D1::ColorF(1.0f, 0.72f, 0.24f, alpha);
 }
 
 [[nodiscard]] bool Contains(const D2D1_RECT_F& rect, float x, float y) noexcept {
@@ -425,6 +436,8 @@ void Overlay::DrawControlBar(unsigned width, unsigned height) {
             D2D1::Ellipse(D2D1::Point2F(filled.right, barY), 7.0f, 7.0f), brush_.Get());
     }
 
+    DrawTrimRange(barLeft, barRight, barY);
+
     // --- Fila de botones ---------------------------------------------------
     const float rowY = h - kButtonRowY;
 
@@ -446,6 +459,64 @@ void Overlay::DrawControlBar(unsigned width, unsigned height) {
                            D2D1::RectF(clockLeft, rowY - 12.0f,
                                        speedRect_.left - 12.0f, rowY + 12.0f),
                            brush_.Get());
+}
+
+// ---------------------------------------------------------------------------
+//  Seleccion de recorte sobre la barra
+//
+//  Los puntos A y B se dibujan como banderines con el rango sombreado entre
+//  ellos. Los tiradores sobresalen por encima y por debajo de la barra: si
+//  quedaran dentro competirian por el mismo pixel que el cabezal de
+//  reproduccion y no habria forma de agarrar el que se quiere.
+// ---------------------------------------------------------------------------
+void Overlay::DrawTrimRange(float barLeft, float barRight, float barY) {
+    trimStartHandle_ = D2D1_RECT_F{};
+    trimEndHandle_   = D2D1_RECT_F{};
+
+    if (model_.duration == kNoTimestamp || model_.duration <= 0) return;
+    if (model_.trimStart == kNoTimestamp && model_.trimEnd == kNoTimestamp) return;
+
+    const float span = barRight - barLeft;
+    const auto positionToX = [&](Micros position) {
+        const double ratio = std::clamp(static_cast<double>(position) /
+                                            static_cast<double>(model_.duration),
+                                        0.0, 1.0);
+        return barLeft + static_cast<float>(span * ratio);
+    };
+
+    const bool hasStart = model_.trimStart != kNoTimestamp;
+    const bool hasEnd   = model_.trimEnd != kNoTimestamp;
+
+    const float startX = hasStart ? positionToX(model_.trimStart) : barLeft;
+    const float endX   = hasEnd ? positionToX(model_.trimEnd) : barRight;
+
+    // Sombreado del intervalo, solo cuando estan los dos extremos.
+    if (hasStart && hasEnd && endX > startX) {
+        brush_->SetColor(TrimColor(0.28f));
+        d2dContext_->FillRectangle(
+            D2D1::RectF(startX, barY - 11.0f, endX, barY + 11.0f), brush_.Get());
+    }
+
+    const auto drawHandle = [&](float x, bool isStart, D2D1_RECT_F& outRect) {
+        brush_->SetColor(TrimColor(0.98f));
+
+        // Tallo.
+        d2dContext_->FillRectangle(
+            D2D1::RectF(x - 1.2f, barY - 13.0f, x + 1.2f, barY + 13.0f), brush_.Get());
+
+        // Banderin, apuntando hacia dentro del intervalo.
+        const float flagWidth = isStart ? 9.0f : -9.0f;
+        d2dContext_->FillRectangle(
+            D2D1::RectF(std::min(x, x + flagWidth), barY - 13.0f,
+                        std::max(x, x + flagWidth), barY - 6.0f),
+            brush_.Get());
+
+        outRect = D2D1::RectF(x - kTrimGrabWidth * 0.5f, barY - 15.0f,
+                              x + kTrimGrabWidth * 0.5f, barY + 15.0f);
+    };
+
+    if (hasStart) drawHandle(startX, true, trimStartHandle_);
+    if (hasEnd)   drawHandle(endX, false, trimEndHandle_);
 }
 
 // ---------------------------------------------------------------------------
@@ -511,13 +582,17 @@ void Overlay::DrawTransport(float left, float centerY) {
 //  esta abierto, para que se entienda de donde sale el desplegable.
 // ---------------------------------------------------------------------------
 void Overlay::DrawSpeedControl(float right, float centerY) {
-    const float snapshotLeft = right - kSnapshotWidth;
+    const float trimLeft     = right - kTrimWidth;
+    const float snapshotLeft = trimLeft - kControlGap - kSnapshotWidth;
     const float speedLeft    = snapshotLeft - kControlGap - kSpeedWidth;
 
     speedRect_ = D2D1::RectF(speedLeft, centerY - kControlHeight * 0.5f,
                              speedLeft + kSpeedWidth, centerY + kControlHeight * 0.5f);
     snapshotRect_ = D2D1::RectF(snapshotLeft, centerY - kControlHeight * 0.5f,
-                                right, centerY + kControlHeight * 0.5f);
+                                snapshotLeft + kSnapshotWidth,
+                                centerY + kControlHeight * 0.5f);
+    trimRect_ = D2D1::RectF(trimLeft, centerY - kControlHeight * 0.5f,
+                            right, centerY + kControlHeight * 0.5f);
 
     // --- Velocidad ---------------------------------------------------------
     if (model_.speedMenuOpen) {
@@ -545,6 +620,32 @@ void Overlay::DrawSpeedControl(float right, float centerY) {
     brush_->SetColor(Rgba(1, 1, 1, 0.80f));
     d2dContext_->DrawEllipse(D2D1::Ellipse(center, 9.0f, 9.0f), brush_.Get(), 1.6f);
     d2dContext_->FillEllipse(D2D1::Ellipse(center, 5.0f, 5.0f), brush_.Get());
+
+    // --- Recorte -----------------------------------------------------------
+    // Unas tijeras: dos aros y dos hojas cruzadas. Se apaga mientras no haya un
+    // intervalo valido, que es como se comunica que el boton aun no hace nada.
+    const bool ready = model_.trimStart != kNoTimestamp &&
+                       model_.trimEnd != kNoTimestamp &&
+                       model_.trimEnd > model_.trimStart && !model_.trimBusy;
+
+    const D2D1_POINT_2F trimCenter =
+        D2D1::Point2F((trimRect_.left + trimRect_.right) * 0.5f, centerY);
+
+    brush_->SetColor(model_.trimBusy ? TrimColor(0.45f)
+                                     : (ready ? TrimColor(0.98f) : Rgba(1, 1, 1, 0.32f)));
+
+    const float bladeTop = trimCenter.y - 8.0f;
+    const float pivotY   = trimCenter.y + 1.0f;
+    d2dContext_->DrawLine(D2D1::Point2F(trimCenter.x - 5.0f, bladeTop),
+                          D2D1::Point2F(trimCenter.x + 3.0f, pivotY), brush_.Get(), 1.5f);
+    d2dContext_->DrawLine(D2D1::Point2F(trimCenter.x + 5.0f, bladeTop),
+                          D2D1::Point2F(trimCenter.x - 3.0f, pivotY), brush_.Get(), 1.5f);
+    d2dContext_->DrawEllipse(
+        D2D1::Ellipse(D2D1::Point2F(trimCenter.x - 4.0f, trimCenter.y + 6.0f), 3.0f, 3.0f),
+        brush_.Get(), 1.4f);
+    d2dContext_->DrawEllipse(
+        D2D1::Ellipse(D2D1::Point2F(trimCenter.x + 4.0f, trimCenter.y + 6.0f), 3.0f, 3.0f),
+        brush_.Get(), 1.4f);
 }
 
 void Overlay::DrawSpeedMenu() {
@@ -657,9 +758,9 @@ void Overlay::DrawWelcome(unsigned width, unsigned height) {
     static constexpr std::wstring_view kKeysLeft  = L"Espacio\nIzq / Der\nF";
     static constexpr std::wstring_view kTextLeft  =
         L"reproducir o pausar\nfotograma a fotograma\npantalla completa";
-    static constexpr std::wstring_view kKeysRight = L"Ctrl + rueda\nZ / X\nS";
+    static constexpr std::wstring_view kKeysRight = L"Ctrl + rueda\nS\nA / B";
     static constexpr std::wstring_view kTextRight =
-        L"ampliar\najustar / tamaño real\nguardar el fotograma";
+        L"ampliar\nguardar el fotograma\nmarcar un recorte";
 
     const float hintTop    = separatorY + 16.0f;
     const float hintBottom = top + boxHeight - 12.0f;
@@ -814,6 +915,21 @@ bool Overlay::HitTestStepBack(int x, int y) const noexcept {
 bool Overlay::HitTestStepForward(int x, int y) const noexcept {
     if (!model_.showControls || model_.showWelcome) return false;
     return Contains(stepForwardRect_, static_cast<float>(x), static_cast<float>(y));
+}
+
+bool Overlay::HitTestTrim(int x, int y) const noexcept {
+    if (!model_.showControls || model_.showWelcome) return false;
+    return Contains(trimRect_, static_cast<float>(x), static_cast<float>(y));
+}
+
+bool Overlay::HitTestTrimStart(int x, int y) const noexcept {
+    if (!model_.showControls || model_.showWelcome) return false;
+    return Contains(trimStartHandle_, static_cast<float>(x), static_cast<float>(y));
+}
+
+bool Overlay::HitTestTrimEnd(int x, int y) const noexcept {
+    if (!model_.showControls || model_.showWelcome) return false;
+    return Contains(trimEndHandle_, static_cast<float>(x), static_cast<float>(y));
 }
 
 bool Overlay::HitTestSpeed(int x, int y) const noexcept {

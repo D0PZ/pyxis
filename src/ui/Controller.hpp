@@ -96,6 +96,12 @@ private:
     void RequestSnapshot();
     void TakeSnapshot();   // hilo de presentacion
 
+    // ---- Recorte ----------------------------------------------------------
+    void SetTrimPoint(bool isStart);
+    void ClearTrim();
+    void StartTrim();
+    [[nodiscard]] Micros SeekBarPositionAt(int x, int y) const;
+
     void OnKeyDown(int virtualKey, bool shift, bool control, bool repeated);
     void OnKeyUp(int virtualKey);
     void OnFocusLost();
@@ -168,6 +174,18 @@ private:
     // La captura la pide la interfaz y la ejecuta el hilo de presentacion, que
     // es el unico dueno del fotograma y del renderizador.
     std::atomic<bool> snapshotRequested_{false};
+
+    // Recorte. Los puntos son atomicos porque los dibuja el hilo de
+    // presentacion; la exportacion corre en su propio hilo porque copiar
+    // cientos de megabytes bloquearia la interfaz durante segundos.
+    std::atomic<Micros> trimStart_{kNoTimestamp};
+    std::atomic<Micros> trimEnd_{kNoTimestamp};
+    std::atomic<bool>   trimBusy_{false};
+    std::thread         trimThread_;
+
+    // Que tirador de recorte se esta arrastrando: 0 ninguno, -1 el inicio,
+    // +1 el final.
+    int draggingTrim_ = 0;
 
     // Encuadre. Lo escribe el hilo de interfaz y lo lee el de presentacion en
     // cada fotograma, de ahi el cerrojo. Es una estructura de doce bytes que se

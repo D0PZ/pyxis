@@ -82,6 +82,7 @@ set(PYXIS_SOURCES
 
     src/core/Log.cpp
     src/core/Text.cpp
+    src/core/Paths.cpp
     src/core/Error.cpp
     src/core/Clock.cpp
     src/core/Thread.cpp
@@ -91,6 +92,7 @@ set(PYXIS_SOURCES
     src/media/VideoDecoder.cpp
     src/media/AudioDecoder.cpp
     src/media/Player.cpp
+    src/media/Trimmer.cpp
 
     src/render/Device.cpp
     src/render/SwapChain.cpp

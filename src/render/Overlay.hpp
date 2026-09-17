@@ -59,6 +59,11 @@ struct OverlayModel {
     // cargar nada. Sustituye a la barra de control mientras no haya video.
     bool showWelcome = false;
 
+    // Recorte: puntos A y B sobre la barra. kNoTimestamp = sin marcar.
+    Micros trimStart = kNoTimestamp;
+    Micros trimEnd   = kNoTimestamp;
+    bool   trimBusy  = false;   // exportacion en curso
+
     // Menu de velocidades desplegado (clic derecho sobre el indicador).
     bool speedMenuOpen = false;
 
@@ -93,6 +98,11 @@ public:
     // Controles a la derecha de la barra.
     [[nodiscard]] bool HitTestSpeed(int x, int y) const noexcept;
     [[nodiscard]] bool HitTestSnapshot(int x, int y) const noexcept;
+    [[nodiscard]] bool HitTestTrim(int x, int y) const noexcept;
+
+    // Tiradores de los puntos A y B sobre la barra de progreso.
+    [[nodiscard]] bool HitTestTrimStart(int x, int y) const noexcept;
+    [[nodiscard]] bool HitTestTrimEnd(int x, int y) const noexcept;
 
     // La bienvenida ocupa toda la ventana: cualquier clic abre el dialogo.
     [[nodiscard]] bool WelcomeVisible() const noexcept { return model_.showWelcome; }
@@ -111,6 +121,7 @@ private:
 
     void DrawControlBar(unsigned width, unsigned height);
     void DrawTransport(float left, float centerY);
+    void DrawTrimRange(float barLeft, float barRight, float barY);
     void DrawSpeedControl(float right, float centerY);
     void DrawSpeedMenu();
     void DrawWelcome(unsigned width, unsigned height);
@@ -176,6 +187,9 @@ private:
     D2D1_RECT_F stepForwardRect_{};
     D2D1_RECT_F speedRect_{};
     D2D1_RECT_F snapshotRect_{};
+    D2D1_RECT_F trimRect_{};
+    D2D1_RECT_F trimStartHandle_{};
+    D2D1_RECT_F trimEndHandle_{};
     D2D1_RECT_F speedMenuRect_{};
     float       speedMenuItemHeight_ = 0.0f;
 };
