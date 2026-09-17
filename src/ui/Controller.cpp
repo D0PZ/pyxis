@@ -470,7 +470,20 @@ void Controller::UpdateHdrMode(const VideoFrame& frame) {
         now - displayQueriedAt_ >= kDisplayQueryInterval) {
         lastContentHdr_   = contentIsHdr;
         displayQueriedAt_ = now;
-        cachedDisplay_    = swapChain_.QueryDisplayCapabilities();
+
+        const DisplayCapabilities previous = cachedDisplay_;
+        cachedDisplay_ = swapChain_.QueryDisplayCapabilities();
+
+        // Se registra cuando cambia lo que el panel dice de si mismo, no cada
+        // medio segundo. Sin esta linea no habia forma de saber desde fuera por
+        // que el HDR no se activa: si es que el contenido no lo pide o es que
+        // la pantalla no puede, que son dos diagnosticos muy distintos.
+        if (previous.supportsHdr10 != cachedDisplay_.supportsHdr10 ||
+            previous.maxLuminanceNits != cachedDisplay_.maxLuminanceNits) {
+            PYXIS_INFO("Pantalla: HDR10 {}, {:.0f} nits de pico, {:.0f} sostenidos",
+                       cachedDisplay_.supportsHdr10 ? "si" : "no",
+                       cachedDisplay_.maxLuminanceNits, cachedDisplay_.maxFullFrameNits);
+        }
     }
 
     // El HDR se activa solo cuando AMBAS condiciones se cumplen. Forzarlo con

@@ -4,6 +4,11 @@
 # roto, porque no lanza ningun error: simplemente se ve mal -lavado o
 # quemado- y solo lo nota quien tenga material HDR a mano.
 #
+# OJO con lo que cubre: en un monitor SDR se recorre la decodificacion de 10
+# bits, el reconocimiento de las etiquetas y el mapeo de tonos PQ -> sRGB. La
+# SALIDA en HDR10 -y la interfaz compuesta en PQ- necesita un panel HDR, y el
+# caso lo dice en su salida en lugar de fingir que lo probo.
+#
 # El archivo va etiquetado como PQ BT.2020 y codificado con FFV1 de 10 bits. El
 # codec no importa: lo que elige el camino del shader son las ETIQUETAS. De paso
 # se recorre el repliegue por software, porque FFV1 no tiene aceleracion.
@@ -34,10 +39,24 @@ try {
     Assert-True ($output.Count -gt 0) "la cadena de intercambio no declaro el espacio de color"
     Write-Detail ($output[0] -replace '^.*\] ', '')
 
-    if ($output[0] -match 'SDR') {
-        Write-Detail "monitor SDR: se ejercita el mapeo de tonos PQ -> sRGB"
+    # Que camino se recorre no depende solo del contenido: la salida solo pasa a
+    # HDR10 si el panel lo admite. Distinguirlo importa porque son dos ramas
+    # distintas del shader y una de las dos se queda sin probar.
+    $panel = @(Get-PyxisLog $session -Pattern 'Pantalla: HDR10')
+    Assert-True ($panel.Count -gt 0) "no se consulto la capacidad HDR del monitor"
+    Write-Detail ($panel[0] -replace '^.*\] ', '')
+
+    if ($panel[0] -match 'HDR10 si') {
+        # Contenido PQ y panel PQ: la salida TIENE que pasar a HDR10, y con ella
+        # la superposicion se compone en PQ en vez de en sRGB.
+        Assert-True ($output[-1] -match 'HDR10') `
+                    "el monitor admite HDR10 y la salida se quedo en SDR: $($output[-1])"
+        Write-Detail "se ejercita el paso directo PQ -> PQ y la interfaz compuesta en PQ"
     } else {
-        Write-Detail "monitor HDR: se ejercita el paso directo PQ -> PQ"
+        Assert-True ($output[0] -match 'SDR') `
+                    "el monitor no admite HDR10 y aun asi la salida se puso en HDR: $($output[0])"
+        Write-Detail "se ejercita el mapeo de tonos PQ -> sRGB"
+        Write-Detail "SIN CUBRIR: la salida HDR10 necesita un monitor HDR activado en Windows"
     }
 
     # Que decodifique de verdad, no que abra y se quede parado.

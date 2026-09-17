@@ -78,7 +78,7 @@ lo que podrían, y lo dicen en su salida.
 | `05-recorte-copia` | recorte A/B sin recodificar, y que Pyxis sepa reabrirlo |
 | `06-recorte-con-ediciones` | con encuadre, la exportación sale con las dimensiones recortadas |
 | `07-audio-en-la-exportacion` | la exportación conserva la pista de audio |
-| `08-hdr-mapeo-de-tonos` | PQ / BT.2020 / 10 bits se reconocen |
+| `08-hdr-mapeo-de-tonos` | PQ / BT.2020 / 10 bits se reconocen y se mapean a la pantalla |
 | `09-decodificacion-por-software` | `--no-hardware` funciona y no toca D3D11VA |
 | `10-perdida-de-dispositivo` | se recupera de `DXGI_ERROR_DEVICE_REMOVED` y sigue respondiendo |
 | `11-pool-que-no-cabe` | un pool imposible reintenta con lo justo en vez de caer a software |
@@ -86,6 +86,14 @@ lo que podrían, y lo dicen en su salida.
 Los cuatro últimos existen porque sus caminos **nunca se habían ejecutado**. Son
 los que más fácil pasan desapercibidos rotos: ninguno lanza un error visible
 cuando falla, solo se ve mal o se oye mal.
+
+**Lo que sigue sin cubrirse: la salida en HDR10.** El caso 08 comprueba que el
+contenido PQ se reconoce y se mapea, pero en un monitor SDR la cadena de
+intercambio nunca pasa a `R10G10B10A2`, así que ni el paso directo PQ → PQ ni la
+interfaz compuesta en PQ llegan a ejecutarse. El caso lo dice en su salida en
+lugar de fingir que lo probó, y en cuanto se ejecute con el HDR activado en
+Windows pasa a exigirlo. Es la única rama del programa que sigue sin haberse
+ejecutado nunca, y no se puede arreglar desde el código.
 
 ---
 
