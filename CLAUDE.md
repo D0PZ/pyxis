@@ -495,6 +495,13 @@ error que no se puede provocar desde fuera, añádele su válvula aquí.
 - **Nuevo camino de error** → si no se puede provocar desde fuera, dale una
   válvula en `core/Fault.hpp` y un caso en `tests/cases/`. Los cuatro caminos
   que llevaban meses sin ejecutarse escondían dos fallos reales entre ellos.
+- **Algo que deba anclar la barra visible** → la lista de `interactionOpen` en
+  `Controller::BuildOverlayModel`. Solo entra ahí lo que está **abierto** y el
+  usuario está manipulando (un menú, el editor de encuadre, el panel de
+  ajustes, una exportación en curso). La pausa no cuenta: cada pulsación ya
+  marca actividad, así que pasando fotogramas la barra se mantiene sola sin
+  taparle el vídeo a quien solo está mirando un cuadro parado.
+
 - **Nuevo control en la barra** → dibujo en `Overlay::DrawControlBar` (o un
   `Draw*` propio), prueba de impacto como `HitTestSpeed`, y reparto del clic en
   `Controller::OnLeftButtonDown`. El orden de ese reparto importa: el menú

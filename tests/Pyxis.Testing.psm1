@@ -62,6 +62,8 @@ namespace Pyxis {
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out Rect r);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
 
+    public const uint WM_KILLFOCUS   = 0x0008;
+    public const uint WM_SETFOCUS    = 0x0007;
     public const uint WM_KEYDOWN     = 0x0100;
     public const uint WM_KEYUP       = 0x0101;
     public const uint WM_MOUSEMOVE   = 0x0200;
@@ -243,6 +245,27 @@ function Send-PyxisDrag {
     [void][Pyxis.Interop]::PostMessage($Session.Handle, [Pyxis.Interop]::WM_LBUTTONUP,
                                        [IntPtr]0, (ConvertTo-LParam $ToX $ToY))
     Start-Sleep -Milliseconds 400
+}
+
+<#
+ .SYNOPSIS
+  Simula que la ventana pierde o recupera el foco.
+
+ .DESCRIPTION
+  Se manda el mensaje directamente en lugar de activar otra ventana de verdad.
+  Robarle el foco a la ventana exigiria crear y activar otra, y eso convierte la
+  prueba en una carrera con el gestor de ventanas: en una maquina cargada la
+  activacion tarda, y en una sesion remota puede no ocurrir nunca.
+#>
+function Send-PyxisFocus {
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][bool]$Focused
+    )
+
+    $message = if ($Focused) { [Pyxis.Interop]::WM_SETFOCUS } else { [Pyxis.Interop]::WM_KILLFOCUS }
+    [void][Pyxis.Interop]::PostMessage($Session.Handle, $message, [IntPtr]0, [IntPtr]0)
+    Start-Sleep -Milliseconds 250
 }
 
 <#
@@ -431,6 +454,35 @@ function Test-PyxisCanOpen {
     }
 }
 
+<#
+ .SYNOPSIS
+  Espera a que un patron aparezca en el registro al menos N veces.
+
+ .DESCRIPTION
+  Para lo que se mide por TRANSICIONES y no por presencia. Un "ya aparece en el
+  archivo" no distingue el cambio que acaba de provocar la prueba del que
+  ocurrio al arrancar, y esa confusion produce verdes falsos.
+#>
+function Wait-PyxisLogCount {
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][string]$Pattern,
+        [Parameter(Mandatory)][int]$AtLeast,
+        [int]$TimeoutSeconds = 15,
+        [int]$PollMs = 300
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $count = 0
+    while ((Get-Date) -lt $deadline) {
+        $count = @(Get-PyxisLog $Session -Pattern $Pattern).Count
+        if ($count -ge $AtLeast) { return $count }
+        if ($Session.Process.HasExited) { break }
+        Start-Sleep -Milliseconds $PollMs
+    }
+    return $count
+}
+
 # --- Aserciones -------------------------------------------------------------
 #
 # Fallan lanzando. El corredor captura y marca el caso en rojo; lo que interesa
@@ -493,7 +545,9 @@ function Write-Detail {
 }
 
 Export-ModuleMember -Function Start-Pyxis, Stop-Pyxis, Send-PyxisKey, Send-PyxisClick,
-                              Send-PyxisDrag, Get-PyxisControlPoint, Get-PyxisLog,
-                              Wait-PyxisLog, Wait-NewOutput, Test-PyxisCanOpen,
+                              Send-PyxisDrag, Send-PyxisFocus, Get-PyxisControlPoint,
+                              Get-PyxisLog,
+                              Wait-PyxisLog, Wait-PyxisLogCount, Wait-NewOutput,
+                              Test-PyxisCanOpen,
                               Get-FirstLine, Assert-True, Assert-AtLeast,
                               Assert-NoErrors, Skip-Case, Write-Detail

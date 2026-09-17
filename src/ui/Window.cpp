@@ -173,6 +173,11 @@ LRESULT Window::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_SETFOCUS: {
+            if (callbacks_.onFocusGained) callbacks_.onFocusGained();
+            return 0;
+        }
+
         case WM_MOUSEMOVE: {
             if (callbacks_.onMouseMove) {
                 callbacks_.onMouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));

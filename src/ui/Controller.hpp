@@ -158,6 +158,17 @@ private:
 
     // Estado de la interfaz, compartido entre ambos hilos.
     std::atomic<Micros> lastActivity_{0};
+
+    // La ventana arranca con el foco. Lo escribe el hilo de interfaz desde
+    // WM_SETFOCUS / WM_KILLFOCUS y lo lee el de presentacion al decidir si
+    // dibuja la barra.
+    std::atomic<bool> windowFocused_{true};
+
+    // Ultimo valor publicado de showControls, para registrar solo los cambios.
+    // Arranca en falso porque antes del primer fotograma no hay nada dibujado:
+    // con true, abrir la aplicacion registraba un ocultado que no ocurrio.
+    // Pertenece al hilo de presentacion.
+    bool controlsVisible_ = false;
     std::atomic<bool>   showStats_{false};
     std::atomic<bool>   seeking_{false};
 

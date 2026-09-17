@@ -21,7 +21,7 @@ namespace pyxis {
 namespace {
 
 // Tiempo sin actividad del raton tras el cual la barra de control se oculta.
-constexpr Micros kControlsHideDelay = 3 * kMicrosPerSecond;
+constexpr Micros kControlsHideDelay = 2 * kMicrosPerSecond;
 constexpr Micros kToastDuration     = 2 * kMicrosPerSecond;
 
 constexpr Micros kSeekSmall  = 5 * kMicrosPerSecond;
@@ -109,6 +109,7 @@ int Controller::Run(const Options& options, int commandShow) {
         },
         .onKeyUp          = [this](int key) { OnKeyUp(key); },
         .onFocusLost      = [this] { OnFocusLost(); },
+        .onFocusGained    = [this] { windowFocused_.store(true, std::memory_order_relaxed); },
         .onMouseMove      = [this](int x, int y) { OnMouseMove(x, y); },
         .onLeftButtonDown = [this](int x, int y) { OnLeftButtonDown(x, y); },
         .onLeftButtonUp   = [this](int x, int y) { OnLeftButtonUp(x, y); },
@@ -552,15 +553,39 @@ void Controller::BuildOverlayModel(OverlayModel& model) {
     model.speedMenuOpen      = speedMenuOpen_.load(std::memory_order_relaxed);
     model.speedMenuHighlight = speedMenuHighlight_.load(std::memory_order_relaxed);
 
-    // Los controles permanecen visibles si esta en pausa: ocultar la barra en
-    // pausa obliga a mover el raton para saber donde se quedo la reproduccion.
-    const bool trimPinned = model.trimBusy || model.trimStart != kNoTimestamp ||
-                            model.trimEnd != kNoTimestamp ||
-                            model.cropEditing || model.filtersOpen;
+    // La barra se esconde a los dos segundos sin actividad, este o no en pausa.
+    // Antes la pausa la dejaba clavada, lo que en la practica significaba que
+    // pasando fotogramas nunca desaparecia; ahora cada pulsacion cuenta como
+    // actividad y la mantiene viva mientras se usa, que es el mismo efecto sin
+    // taparle el video a quien solo esta mirando un cuadro parado.
+    //
+    // Lo que si sigue anclado es lo que esta ABIERTO: un menu desplegado, el
+    // editor de encuadre, el panel de ajustes o una exportacion en curso. Son
+    // interfaz en uso, no un adorno, y esconderla a media interaccion seria
+    // quitarle al usuario lo que esta manipulando.
+    const bool interactionOpen = model.speedMenuOpen || model.cropEditing ||
+                                 model.filtersOpen || model.trimBusy;
 
-    model.showControls = !model.showWelcome &&
-                         (model.paused || model.speedMenuOpen || trimPinned ||
+    // Sin foco no se muestra nada. Con la ventana en segundo plano la barra es
+    // ruido sobre el video de otra persona, y ademas el raton se esta moviendo
+    // en otro sitio: la inactividad nunca llegaria a cumplirse.
+    const bool focused = windowFocused_.load(std::memory_order_relaxed);
+
+    model.showControls = focused && !model.showWelcome &&
+                         (interactionOpen ||
                           (now - lastActivity) < kControlsHideDelay);
+
+    // Solo las transiciones, y en depuracion: sin esto no hay forma de
+    // comprobar el auto-ocultado desde fuera, y registrarlo por fotograma
+    // llenaria el archivo a sesenta lineas por segundo.
+    if (model.showControls != controlsVisible_) {
+        controlsVisible_ = model.showControls;
+        PYXIS_DEBUG("Controles {}",
+                    model.showControls  ? "visibles"
+                    : model.showWelcome ? "ocultos: pantalla de bienvenida"
+                    : !focused          ? "ocultos por perder el foco"
+                                        : "ocultos por inactividad");
+    }
 
     {
         std::lock_guard<std::mutex> lock(toastMutex_);
@@ -1110,6 +1135,8 @@ void Controller::OnKeyUp(int virtualKey) {
 }
 
 void Controller::OnFocusLost() {
+    windowFocused_.store(false, std::memory_order_relaxed);
+
     // Sin WM_KEYUP que lo detenga, el avance seguiria corriendo con la ventana
     // en segundo plano.
     stepDirection_.store(0, std::memory_order_relaxed);

@@ -41,8 +41,11 @@ public:
         std::function<void(int virtualKey)> onKeyUp;
 
         // Al perder el foco no llega ningun WM_KEYUP, asi que sin esto una
-        // tecla mantenida se quedaria "pulsada" para siempre.
+        // tecla mantenida se quedaria "pulsada" para siempre. El par tambien
+        // gobierna la barra de controles, que se esconde con la ventana en
+        // segundo plano.
         std::function<void()> onFocusLost;
+        std::function<void()> onFocusGained;
 
         std::function<void(int x, int y)> onMouseMove;
         std::function<void(int x, int y)> onLeftButtonDown;

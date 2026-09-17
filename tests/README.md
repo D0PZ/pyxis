@@ -82,6 +82,7 @@ lo que podrían, y lo dicen en su salida.
 | `09-decodificacion-por-software` | `--no-hardware` funciona y no toca D3D11VA |
 | `10-perdida-de-dispositivo` | se recupera de `DXGI_ERROR_DEVICE_REMOVED` y sigue respondiendo |
 | `11-pool-que-no-cabe` | un pool imposible reintenta con lo justo en vez de caer a software |
+| `12-autoocultar-la-barra` | la barra se esconde a los 2 s sin actividad y al perder el foco |
 
 Los cuatro últimos existen porque sus caminos **nunca se habían ejecutado**. Son
 los que más fácil pasan desapercibidos rotos: ninguno lanza un error visible
