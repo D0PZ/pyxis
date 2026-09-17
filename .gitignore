@@ -43,3 +43,8 @@ CMakeUserPresets.json
 *.m4v
 *.wmv
 *.flv
+
+# Pruebas: material generado por mkmedia y registros de cada ejecucion. El
+# generador va al repositorio; sus productos, no.
+/tests/media/
+/tests/.work/

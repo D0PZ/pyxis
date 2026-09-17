@@ -21,6 +21,7 @@
 // ============================================================================
 
 #include "core/Error.hpp"
+#include "core/Fault.hpp"
 #include "core/Log.hpp"
 #include "core/Text.hpp"
 #include "ui/Controller.hpp"
@@ -46,6 +47,8 @@ constexpr const wchar_t* kUsage =
     L"  -f, --fullscreen     arrancar a pantalla completa\n"
     L"      --no-hardware    desactivar la decodificación por GPU (diagnóstico)\n"
     L"      --volume N       volumen inicial, de 0 a 100\n"
+    L"      --fault NOMBRE   provocar un fallo a proposito (pruebas):\n"
+    L"                       device-loss, pool-full\n"
     L"  -v, --verbose        registro detallado\n"
     L"      --log ARCHIVO    duplicar el registro en un archivo\n"
     L"  -h, --help           mostrar esta ayuda\n"
@@ -85,6 +88,7 @@ constexpr const wchar_t* kUsage =
 struct ParsedCommandLine {
     pyxis::Options options;
     std::wstring   logFile;
+    std::wstring   badFault;   // --fault con un nombre que no existe
     bool           showHelp = false;
 };
 
@@ -108,6 +112,16 @@ ParsedCommandLine ParseCommandLine() {
             parsed.options.startFullscreen = true;
         } else if (argument == L"--no-hardware") {
             parsed.options.disableHardware = true;
+        } else if (argument == L"--fault") {
+            // Solo para las pruebas: recorre a proposito los caminos de error
+            // que en uso normal exigen que se rompa algo de verdad.
+            const std::wstring value = nextValue();
+            const pyxis::Fault fault = pyxis::ParseFault(value);
+            if (fault == pyxis::Fault::None) {
+                parsed.badFault = value;
+            } else {
+                pyxis::SetFault(fault);
+            }
         } else if (argument == L"-v" || argument == L"--verbose") {
             parsed.options.verbose = true;
         } else if (argument == L"--log") {
@@ -157,6 +171,16 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR, int commandShow) {
                                                 : pyxis::log::Level::Info);
     if (!parsed.logFile.empty()) {
         pyxis::log::SetLogFile(parsed.logFile);
+    }
+
+    // Un --fault mal escrito tiene que cantar. Arrancar como si nada dejaria
+    // una prueba en verde sin haber ejercitado el camino que pretendia probar,
+    // que es peor que no tenerla.
+    if (!parsed.badFault.empty()) {
+        ShowMessage(L"Fallo inyectado desconocido: " + parsed.badFault +
+                        L"\n\nValores admitidos: device-loss, pool-full",
+                    MB_ICONERROR);
+        return 2;
     }
 
     PYXIS_INFO("Pyxis {} arrancando", PYXIS_VERSION);

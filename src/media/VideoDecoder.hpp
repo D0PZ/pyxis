@@ -74,6 +74,14 @@ public:
     void Flush() noexcept;
 
     [[nodiscard]] bool IsHardware() const noexcept { return hardware_; }
+
+    // Plazas del pool que quedan por encima de lo que el codec reserva para sus
+    // fotogramas de referencia. Cero mientras no se haya negociado el formato o
+    // si se decodifica por software. Es el techo real del historial de avance
+    // manual: cada fotograma retenido ocupa una de estas plazas.
+    [[nodiscard]] int PoolSlack() const noexcept {
+        return poolSlack_.load(std::memory_order_acquire);
+    }
     [[nodiscard]] int  Width() const noexcept  { return width_; }
     [[nodiscard]] int  Height() const noexcept { return height_; }
     [[nodiscard]] const std::string& DecoderName() const noexcept { return decoderName_; }
@@ -103,6 +111,12 @@ private:
     int          width_        = 0;
     int          height_       = 0;
     bool         hardware_     = false;
+    bool         colorLogged_  = false;
+
+    // Holgura que el pool D3D11VA concedio DE VERDAD, por encima de lo que el
+    // codec necesita para sus fotogramas de referencia. La escribe la
+    // negociacion de formato y la lee el hilo de presentacion, de ahi el atomico.
+    std::atomic<int> poolSlack_{0};
     int          extraPool_    = 8;
     std::string  decoderName_;
 };

@@ -1,6 +1,7 @@
 #include "render/SwapChain.hpp"
 
 #include "core/Error.hpp"
+#include "core/Fault.hpp"
 #include "core/Log.hpp"
 
 #include <algorithm>
@@ -74,6 +75,11 @@ void SwapChain::Create(Device& device, HWND window) {
 
     PYXIS_INFO("Cadena de intercambio {}x{} modo flip, {} buferes, desgarro {}",
                width_, height_, kBufferCount, tearingAllowed_ ? "permitido" : "no soportado");
+
+    // El estado inicial tambien se registra, no solo los cambios. De el depende
+    // que rama del shader dibuja, y sin esta linea la unica forma de saberlo
+    // era que hubiera habido una transicion.
+    PYXIS_INFO("Salida configurada en {}", hdrOutput_ ? "HDR10 (PQ BT.2020)" : "SDR (sRGB)");
 }
 
 void SwapChain::CreateRenderTarget() {
@@ -194,6 +200,14 @@ void SwapChain::Present(PresentMode mode) {
         // combinacion con un error dificil de diagnosticar.
         syncInterval = 0;
         flags        = DXGI_PRESENT_ALLOW_TEARING;
+    }
+
+    // Inyeccion de fallos (--fault device-loss). Se dispara aqui y no en
+    // Controller para que la recuperacion arranque desde el mismo sitio que
+    // cuando la averia es real: una excepcion saliendo de Present.
+    if (FaultFires(Fault::DeviceLoss)) {
+        ThrowHResult(DXGI_ERROR_DEVICE_REMOVED,
+                     "perdida de dispositivo inyectada (--fault device-loss)");
     }
 
     const HRESULT hr = swapChain_->Present(syncInterval, flags);

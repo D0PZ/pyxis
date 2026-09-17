@@ -49,6 +49,26 @@ enum class ColorRange : std::uint8_t {
     Full,      // "PC": luma 0-255
 };
 
+// Nombres para el registro. Sin ellos, diagnosticar un problema de color
+// obliga a adivinar que camino tomo el shader.
+[[nodiscard]] constexpr const char* DescribeMatrix(YuvMatrix matrix) noexcept {
+    switch (matrix) {
+        case YuvMatrix::BT601:     return "BT.601";
+        case YuvMatrix::BT709:     return "BT.709";
+        case YuvMatrix::BT2020NCL: return "BT.2020";
+    }
+    return "?";
+}
+
+[[nodiscard]] constexpr const char* DescribeTransfer(TransferFunction transfer) noexcept {
+    switch (transfer) {
+        case TransferFunction::Sdr: return "SDR";
+        case TransferFunction::Pq:  return "PQ (HDR10)";
+        case TransferFunction::Hlg: return "HLG";
+    }
+    return "?";
+}
+
 struct ColorInfo {
     YuvMatrix        matrix   = YuvMatrix::BT709;
     TransferFunction transfer = TransferFunction::Sdr;

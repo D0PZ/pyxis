@@ -61,6 +61,7 @@ src/
 ├── core/               utilidades sin dependencias del dominio
 │   ├── Error.hpp       excepciones para inicializar, códigos para el bucle caliente
 │   ├── Log.hpp         registro con filtro de nivel de coste cero
+│   ├── Fault.hpp       inyección de fallos para las pruebas (--fault)
 │   ├── Clock.hpp       tiempo monótono + MediaClock (el reloj maestro)
 │   ├── Queue.hpp       cola acotada y bloqueante entre etapas
 │   ├── Thread.hpp      MMCSS y nombrado de hilos
@@ -279,6 +280,20 @@ unos 100 MiB, así que el tamaño no puede ser un número fijo: se calcula con
 `IDXGIAdapter3::QueryVideoMemoryInfo` sobre la memoria realmente disponible, no
 sobre la total de la tarjeta.
 
+Pero la VRAM no es el único techo, y el otro es más bajo. **FFmpeg recorta el
+pool a 64 texturas** (`MAX_ARRAY_SIZE` en `hwcontext_d3d11va.c`: la
+especificación de los controladores limita `ArraySize` a 64 en recursos que
+alimentan al decodificador). Pedir más no da error —se recorta en silencio—, así
+que un historial calculado sobre la VRAM puede prometer plazas que no existen.
+De esas 64 salen además los fotogramas de referencia del códec, una veintena en
+HEVC.
+
+Por eso hay dos cálculos y no uno: `ComputeHistoryLimit` decide qué cabe en
+memoria, y `EffectiveHistoryLimit` lo recorta contra `VideoDecoder::PoolSlack`,
+que publica la holgura que el pool concedió **de verdad** al negociar el formato.
+Creerse el primero y no el segundo es como se llega a que el decodificador se
+bloquee pidiendo una superficie que no existe.
+
 Lo que no es evidente: **el número de hilos del decodificador también consume
 pool**. Con `FF_THREAD_FRAME` cada hilo mantiene su propio juego de fotogramas de
 referencia, y en la ruta acelerada esos fotogramas salen del mismo sitio. Pedir
@@ -296,13 +311,25 @@ memoria.
 
 Si aun así el pool no cabe, `NegotiateFormat` reintenta con lo justo antes de
 rendirse. Caer a software por haber pedido holgura sería mucho peor que perder
-la holgura.
+la holgura. Con el recorte a 64 ese reintento ya no se dispara por pedir de más
+—es imposible pedir de más—, sino cuando 64 texturas no caben en la tarjeta: a
+8K en 10 bits son más de 3 GB. Se prueba con `--fault pool-full`.
 
 ## Trampas conocidas
 
 - **`D3D11_BIND_SHADER_RESOURCE` en el pool de D3D11VA.** Se añade en
   `VideoDecoder::NegotiateFormat`, en el único instante en que se puede. Sin esa
   línea el shader no puede leer la textura decodificada y todo el diseño se cae.
+
+- **El pool de D3D11VA no pasa de 64 texturas** y pedir más no da error: se
+  recorta en silencio. Ver la sección del pool, más arriba.
+
+- **`AV_PIX_FMT_D3D11` declara CERO bits por componente.** Es un formato opaco:
+  su `AVPixFmtDescriptor` no describe nada. La profundidad real hay que sacarla
+  del `sw_format` del `AVHWFramesContext`. Sin eso, todo el material de 10 bits
+  decodificado por GPU se trataba como de 8 y la matriz de color salía con un
+  error de décimas de por ciento —invisible, pero justo en el camino que más se
+  cuida aquí. Ver `DeriveColorInfo`.
 
 - **Texturas con relleno.** El pool alinea a múltiplos del macrobloque: una
   imagen de 1920×1080 suele vivir en una textura de 1920×**1088**. De ahí
@@ -395,7 +422,7 @@ los comentarios en español.
 
 ---
 
-## Compilar y probar
+## Compilar y diagnosticar
 
 ```powershell
 .\scripts\build.ps1                              # release
@@ -423,6 +450,35 @@ primera herramienta a mirar** ante cualquier problema de fluidez:
 
 ---
 
+## Pruebas
+
+```powershell
+.	ests
+un-tests.ps1                              # toda la suite
+.	ests
+un-tests.ps1 -Case audio                  # uno
+.	ests
+un-tests.ps1 -Sample 'D:lgo 8K.mkv'     # con material grande
+```
+
+Son pruebas funcionales: abren la ventana, mandan teclas y clics con
+`PostMessage` y leen el registro. No hay pruebas unitarias porque casi todo lo
+interesante —zero-copy, sincronía con el reloj de audio, avance manual, mapeo de
+tonos— solo existe con una GPU real por debajo; una prueba unitaria de eso
+probaría los *mocks*. Los detalles, en `tests/README.md`.
+
+El material se genera con `tests/tools/mkmedia`, que se compila junto al
+reproductor. No se versiona.
+
+Tres caminos solo se recorren cuando algo se rompe de verdad, y para llegar a
+ellos el binario acepta `--fault` (ver `core/Fault.hpp`): `device-loss` lanza
+`DXGI_ERROR_DEVICE_REMOVED` desde dentro de `Present`, y `pool-full` da por
+fallido el primer pool D3D11VA. **No simulan la recuperación, simulan la
+avería**: el error sale por donde saldría el de verdad. Si añades un camino de
+error que no se puede provocar desde fuera, añádele su válvula aquí.
+
+---
+
 ## Al añadir funcionalidad
 
 - **Nuevo formato de píxel** → normalizarlo en `VideoDecoder`, no tocar el
@@ -439,6 +495,9 @@ primera herramienta a mirar** ante cualquier problema de fluidez:
   (`ComputeFitRect`, `ApplyView`, `ClampPan`) precisamente para que la interfaz
   y el renderizador no puedan divergir. No la dupliques en `Controller`.
 - **Nueva métrica** → `PlayerStats` y `Controller::BuildStatsText`.
+- **Nuevo camino de error** → si no se puede provocar desde fuera, dale una
+  válvula en `core/Fault.hpp` y un caso en `tests/cases/`. Los cuatro caminos
+  que llevaban meses sin ejecutarse escondían dos fallos reales entre ellos.
 - **Nuevo control en la barra** → dibujo en `Overlay::DrawControlBar` (o un
   `Draw*` propio), prueba de impacto como `HitTestSpeed`, y reparto del clic en
   `Controller::OnLeftButtonDown`. El orden de ese reparto importa: el menú

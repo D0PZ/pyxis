@@ -277,6 +277,19 @@ winget install Kitware.CMake Ninja-build.Ninja
 
 </details>
 
+<details>
+<summary>Pruebas</summary>
+
+```powershell
+.	estsun-tests.ps1
+```
+
+Once casos funcionales que abren la ventana, le mandan teclas y clics y
+comprueban el registro. El material de prueba se genera solo la primera vez.
+Detalles en [`tests/README.md`](tests/README.md).
+
+</details>
+
 ## Arquitectura
 
 ```

@@ -41,6 +41,12 @@ constexpr double      kHistoryMemoryShare = 0.25;
 constexpr std::size_t kHistoryMinFrames   = 3;
 constexpr std::size_t kHistoryMaxFrames   = 48;
 
+// Techo del pool de texturas de D3D11VA. No es una eleccion nuestra: lo impone
+// FFmpeg en hwcontext_d3d11va.c (MAX_ARRAY_SIZE), porque la especificacion de
+// los controladores limita ArraySize a 64 en recursos que alimentan al
+// decodificador. Pedir mas no da error, simplemente se recorta en silencio.
+constexpr int kHardwarePoolCeiling = 64;
+
 // Tope del rebobinado. Con un historial grande la ventana crece con el, pero
 // decodificar varios segundos de 8K para mostrar un fotograma tampoco vale la
 // pena: a partir de aqui se prefiere rebobinar mas veces.
@@ -133,7 +139,16 @@ void Player::Open(const std::wstring& path) {
             // fotograma que el presentador esta mostrando y el que tiene
             // reservado. Quedarse corto bloquea al decodificador en cada
             // fotograma.
-            config.extraPoolFrames = static_cast<int>(reserved + historyLimit);
+            //
+            // Pedir de mas no sirve de nada: FFmpeg recorta el pool D3D11VA a
+            // 64 texturas en total (MAX_ARRAY_SIZE en hwcontext_d3d11va.c, "the
+            // driver specification limits ArraySize to 64 for decoder-bound
+            // resources"). De ahi salen tambien los fotogramas de referencia
+            // del codec, que en HEVC son una veintena. Cuantas quedan no se
+            // sabe hasta negociar el formato, y por eso el historial se vuelve
+            // a recortar en EffectiveHistoryLimit.
+            config.extraPoolFrames =
+                std::min(static_cast<int>(reserved + historyLimit), kHardwarePoolCeiling);
 
             videoDecoder_.Open(demuxer_.Video(), config);
 
@@ -699,8 +714,34 @@ VideoFrame Player::CloneFrameRef(const VideoFrame& source) {
     return copy;
 }
 
+// ---------------------------------------------------------------------------
+//  Techo real del historial
+//
+//  ComputeHistoryLimit razona en memoria de video libre, que es la restriccion
+//  correcta por software. En la ruta acelerada hay otra mas estrecha y menos
+//  evidente: cada fotograma del historial retiene una plaza del array de
+//  texturas, y ese array no pasa de 64 en total. Descontando los fotogramas de
+//  referencia del codec quedan bastantes menos.
+//
+//  Creerse el limite calculado y no el concedido es como se llega a que el
+//  decodificador se quede sin superficies y se bloquee pidiendo una.
+// ---------------------------------------------------------------------------
+std::size_t Player::EffectiveHistoryLimit() const noexcept {
+    const std::size_t computed = historyLimit_.load(std::memory_order_relaxed);
+
+    const int slack = videoDecoder_.PoolSlack();
+    if (slack <= 0) return computed;   // por software, o aun sin negociar
+
+    // La cola de presentacion y los fotogramas en vuelo salen de la misma
+    // holgura, asi que no son historial.
+    const auto reserved = static_cast<int>(videoFrames_.Capacity() + 10);
+    const auto fromPool = static_cast<std::size_t>(std::max(slack - reserved, 0));
+
+    return std::clamp(std::min(computed, fromPool), kHistoryMinFrames, kHistoryMaxFrames);
+}
+
 void Player::PushHistory(const VideoFrame& frame) {
-    const std::size_t limit = historyLimit_.load(std::memory_order_relaxed);
+    const std::size_t limit = EffectiveHistoryLimit();
     if (limit == 0) return;
 
     VideoFrame copy = CloneFrameRef(frame);
@@ -771,7 +812,7 @@ void Player::PrepareStepCollection(int direction) {
     //                                   este es el que se muestra:
     //                                   el ultimo anterior al limite
     const auto batch = static_cast<Micros>(
-        std::max<std::size_t>(historyLimit_.load(std::memory_order_relaxed), 1));
+        std::max<std::size_t>(EffectiveHistoryLimit(), 1));
 
     Micros window = step * batch;
     if (window < kMinRewindWindow) window = kMinRewindWindow;

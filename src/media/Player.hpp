@@ -227,6 +227,10 @@ private:
                                                  std::size_t reservedFrames) const noexcept;
 
     void PushHistory(const VideoFrame& frame);
+
+    // Historial que de verdad cabe: el calculado por memoria, recortado a las
+    // plazas que el pool de texturas concedio.
+    [[nodiscard]] std::size_t EffectiveHistoryLimit() const noexcept;
     void ForgetHistory() noexcept;
 
     // Intenta satisfacer el paso con lo que ya hay en memoria.

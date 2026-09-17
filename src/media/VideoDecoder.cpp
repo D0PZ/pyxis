@@ -1,6 +1,7 @@
 #include "media/VideoDecoder.hpp"
 
 #include "core/Error.hpp"
+#include "core/Fault.hpp"
 #include "core/Log.hpp"
 
 #include <d3d11.h>
@@ -11,6 +12,8 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <format>
+#include <string>
 #include <thread>
 
 namespace pyxis {
@@ -62,9 +65,26 @@ ColorInfo DeriveColorInfo(const AVFrame* frame) {
     info.range = frame->color_range == AVCOL_RANGE_JPEG ? ColorRange::Full
                                                         : ColorRange::Limited;
 
-    if (const AVPixFmtDescriptor* desc =
-            ::av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format))) {
-        info.bitDepth = desc->comp[0].depth;
+    // De donde sale la profundidad depende de la ruta. En software el formato
+    // del fotograma ya lo dice; en la acelerada, AV_PIX_FMT_D3D11 es opaco y su
+    // descriptor declara CERO bits. Hay que preguntarle al pool por el formato
+    // real que hay detras de la textura.
+    //
+    // Sin esto, todo el material de 10 bits decodificado por la GPU se trataba
+    // como de 8: la matriz YUV se construia con maxCode 255 en vez de 1023 y el
+    // factor de P010 salia 1,0039 en lugar de 1,00096. El error es de decimas
+    // de por ciento -por eso nunca se vio- pero afecta justo al caso que mas se
+    // cuida en este reproductor.
+    AVPixelFormat format = static_cast<AVPixelFormat>(frame->format);
+    if (frame->hw_frames_ctx != nullptr) {
+        const auto* frames =
+            reinterpret_cast<const AVHWFramesContext*>(frame->hw_frames_ctx->data);
+        if (frames != nullptr && frames->sw_format != AV_PIX_FMT_NONE) {
+            format = frames->sw_format;
+        }
+    }
+    if (const AVPixFmtDescriptor* desc = ::av_pix_fmt_desc_get(format)) {
+        if (desc->comp[0].depth > 0) info.bitDepth = desc->comp[0].depth;
     }
 
     // Metadatos HDR: guian el mapeo de tonos cuando la pantalla no alcanza el
@@ -127,6 +147,22 @@ AVPixelFormat VideoDecoder::NegotiateFormat(AVCodecContext* context,
 
         rc = ::av_hwframe_ctx_init(frames);
 
+        PYXIS_DEBUG("pool D3D11VA: base {} + holgura {} = {} -> {}",
+                    baseSize, requested, framesContext->initial_pool_size,
+                    rc < 0 ? DescribeError(ErrorDomain::FFmpeg, rc) : std::string("ok"));
+
+        // Inyeccion de fallos (--fault pool-full). Pedir un pool absurdo NO
+        // sirve para llegar hasta aqui: av_hwframe_ctx_init recorta a 64 antes
+        // de intentar nada, asi que la peticion nunca es demasiado grande. El
+        // reintento solo se recorre cuando la tarjeta se queda sin memoria de
+        // verdad -64 texturas de 8K son mas de 3 GB-, de modo que la unica
+        // forma de probarlo es dar el primer intento por fallido.
+        if (rc >= 0 && requested > 4 && FaultActive(Fault::PoolFull)) {
+            PYXIS_WARN("fallo inyectado: se da por fallido el pool de {} texturas",
+                       framesContext->initial_pool_size);
+            rc = AVERROR(ENOMEM);
+        }
+
         // Si no cabe, se reintenta con lo justo ANTES de rendirse. Caer a
         // software por pedir un pool generoso seria un desastre: la holgura es
         // una comodidad, la aceleracion no.
@@ -158,7 +194,11 @@ AVPixelFormat VideoDecoder::NegotiateFormat(AVCodecContext* context,
         }
 
         context->hw_frames_ctx = frames;   // el contexto pasa a ser el dueno
-        if (self != nullptr) self->hardware_ = true;
+        if (self != nullptr) {
+            self->hardware_ = true;
+            self->poolSlack_.store(framesContext->initial_pool_size - baseSize,
+                                   std::memory_order_release);
+        }
         return AV_PIX_FMT_D3D11;
     }
 
@@ -245,6 +285,7 @@ void VideoDecoder::Open(const Demuxer::Track& track, const Config& config) {
     PYXIS_REQUIRE(track.Valid(), "VideoDecoder::Open sin pista de video");
 
     extraPool_ = std::max(2, config.extraPoolFrames);
+
     timeBase_  = track.timeBase;
 
     const AVCodec* decoder = ::avcodec_find_decoder(track.params->codec_id);
@@ -300,6 +341,7 @@ void VideoDecoder::Close() noexcept {
     scratch_.reset();
     converter_.reset();
     hardware_        = false;
+    poolSlack_.store(0, std::memory_order_release);
     width_           = 0;
     height_          = 0;
     frameDuration_   = 0;
@@ -354,6 +396,23 @@ VideoDecoder::Status VideoDecoder::Receive(VideoFrame& out) {
     if (duration == kNoTimestamp || duration <= 0) duration = frameDuration_;
 
     const ColorInfo color = DeriveColorInfo(source);
+
+    // La colorimetria solo se conoce con un fotograma decodificado delante: las
+    // etiquetas del contenedor mienten a menudo y las del flujo llegan con el
+    // primer fotograma. Se registra una vez porque interpretarla mal es la
+    // causa numero uno de que un reproductor se vea lavado, y sin esta linea no
+    // hay forma de saber desde fuera que camino del shader se esta usando.
+    if (!colorLogged_) {
+        colorLogged_ = true;
+        PYXIS_INFO("Colorimetria: {} {} {} bits, rango {}{}",
+                   DescribeMatrix(color.matrix), DescribeTransfer(color.transfer),
+                   color.bitDepth,
+                   color.range == ColorRange::Full ? "completo" : "limitado",
+                   color.maxMasteringLuminance > 0
+                       ? std::format(", masterizado a {:.0f} cd/m2",
+                                     color.maxMasteringLuminance)
+                       : std::string{});
+    }
 
     if (source->format == AV_PIX_FMT_D3D11) {
         // Ruta zero-copy: data[0] es el ID3D11Texture2D del pool y data[1] es

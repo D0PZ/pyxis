@@ -35,6 +35,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 option(PYXIS_ENABLE_AVX2 "Compilar el codigo propio con AVX2 (FFmpeg despacha en tiempo de ejecucion de todos modos)" OFF)
 option(PYXIS_WARNINGS_AS_ERRORS "Tratar los avisos del compilador como errores" OFF)
+option(PYXIS_BUILD_TOOLS "Compilar las herramientas de tests/ (mkmedia)" ON)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaders.cmake)
 
@@ -183,6 +184,18 @@ set_target_properties(pyxis PROPERTIES
     VS_DPI_AWARE "PerMonitor")
 
 # ---------------------------------------------------------------------------
+#  Herramientas de prueba
+#
+#  mkmedia genera los archivos que la suite necesita (uno con pista de audio,
+#  otro etiquetado como HDR de 10 bits). Se compila por defecto porque es
+#  diminuto y porque una suite que no se puede ejecutar sin pasos manuales
+#  acaba sin ejecutarse.
+# ---------------------------------------------------------------------------
+if(PYXIS_BUILD_TOOLS)
+    add_subdirectory(tests/tools/mkmedia)
+endif()
+
+# ---------------------------------------------------------------------------
 #  Resumen de configuracion
 # ---------------------------------------------------------------------------
 message(STATUS "-----------------------------------------------------------")
@@ -191,4 +204,5 @@ message(STATUS "  Compilador   : MSVC ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "  Triplete     : ${VCPKG_TARGET_TRIPLET}")
 message(STATUS "  CRT          : estatica (/MT)")
 message(STATUS "  AVX2 propio  : ${PYXIS_ENABLE_AVX2}")
+message(STATUS "  Herramientas : ${PYXIS_BUILD_TOOLS}")
 message(STATUS "-----------------------------------------------------------")
