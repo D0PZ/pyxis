@@ -58,9 +58,12 @@ decodifica limpio a cambio de pesar 16 MB en lugar de 130 KB — irrelevante par
 un archivo local que no se versiona.
 
 **Ejemplar grande.** Los archivos generados son diminutos a propósito y no
-sirven para medir el avance manual a 8K. Pasa uno propio con `-Sample` o con la
-variable `PYXIS_TEST_SAMPLE`; sin él, los casos que lo necesitan se adaptan al
-material pequeño y los que no pueden se marcan como omitidos.
+sirven para medir el avance manual a 8K, ni para demostrar que una captura sale
+a resolución nativa cuando el vídeo cabe entero en la ventana. Pasa uno propio
+con `-Sample` o con la variable `PYXIS_TEST_SAMPLE`.
+
+Sin él la suite corre igual —ningún caso se omite— pero cuatro prueban menos de
+lo que podrían, y lo dicen en su salida.
 
 ---
 

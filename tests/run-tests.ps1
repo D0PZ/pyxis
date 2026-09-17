@@ -15,9 +15,11 @@
   Ejecuta solo los casos cuyo nombre contenga este texto.
 
 .PARAMETER Sample
-  Archivo grande y acelerado por hardware para los casos de rendimiento. Los
-  archivos que genera mkmedia son diminutos a proposito y no sirven para medir
-  el avance manual a 8K. Sin este parametro, esos casos se omiten.
+  Archivo grande y acelerado por hardware. Los que genera mkmedia son diminutos
+  a proposito y no sirven para medir el avance manual a 8K ni para demostrar que
+  una captura sale a resolucion nativa y no a la de la ventana. Sin este
+  parametro todos los casos siguen corriendo, pero cuatro de ellos prueban menos
+  de lo que podrian y lo dicen en su salida.
 
 .EXAMPLE
   .\tests\run-tests.ps1
@@ -59,7 +61,7 @@ if ($List) {
         $synopsis = (Get-Content $c.FullName -TotalCount 3 |
                      Where-Object { $_ -match '^\s*#\s*(.+)' } |
                      Select-Object -First 1) -replace '^\s*#\s*', ''
-        '  {0,-28} {1}' -f $c.BaseName, $synopsis
+        '  {0,-31} {1}' -f $c.BaseName, $synopsis
     }
     exit 0
 }
@@ -116,7 +118,7 @@ $context = [pscustomobject]@{
 Write-Host ""
 Write-Host "Pyxis - suite funcional" -ForegroundColor Cyan
 Write-Host "  ejecutable : $Exe"
-Write-Host "  ejemplar   : $(if ($Sample) { $Sample } else { '(ninguno: se omitiran los casos de 8K)' })"
+Write-Host "  ejemplar   : $(if ($Sample) { $Sample } else { '(ninguno: los casos de 8K probaran menos)' })"
 Write-Host "  casos      : $($cases.Count)"
 Write-Host ""
 
@@ -124,7 +126,7 @@ $results = @()
 
 foreach ($file in $cases) {
     $name = $file.BaseName
-    Write-Host ("  {0,-30}" -f $name) -NoNewline
+    Write-Host ("  {0,-31}" -f $name) -NoNewline
     $started = Get-Date
 
     try {
