@@ -54,11 +54,47 @@ struct ViewTransform {
     [[nodiscard]] bool operator==(const ViewTransform&) const = default;
 };
 
+// ---------------------------------------------------------------------------
+//  Recorte de encuadre
+//
+//  En coordenadas NORMALIZADAS del fotograma, no en pixeles. Asi el recorte
+//  sobrevive a un cambio de resolucion a mitad de flujo -que ocurre en
+//  emisiones adaptativas- sin quedarse apuntando fuera de la imagen.
+// ---------------------------------------------------------------------------
+struct CropRect {
+    float left   = 0.0f;
+    float top    = 0.0f;
+    float right  = 1.0f;
+    float bottom = 1.0f;
+
+    [[nodiscard]] float Width() const noexcept { return right - left; }
+    [[nodiscard]] float Height() const noexcept { return bottom - top; }
+
+    [[nodiscard]] bool IsFull() const noexcept {
+        return left <= 0.0f && top <= 0.0f && right >= 1.0f && bottom >= 1.0f;
+    }
+
+    [[nodiscard]] bool operator==(const CropRect&) const = default;
+};
+
 // Ajustes de imagen del usuario. Valores neutros = sin efecto.
 struct ImageAdjustments {
-    float brightness = 0.0f;   // -1 .. +1
+    float brightness = 0.0f;   // -1 .. +1   desplazamiento
+    float exposure   = 0.0f;   // -3 .. +3   pasos de diafragma
     float contrast   = 1.0f;   //  0 .. +2
     float saturation = 1.0f;   //  0 .. +2
+    float gamma      = 1.0f;   // 0.3 .. 3
+    float shadows    = 1.0f;   //  0 .. +2
+    float midtones   = 1.0f;   //  0 .. +2
+    float highlights = 1.0f;   //  0 .. +2
+
+    [[nodiscard]] bool IsNeutral() const noexcept {
+        return brightness == 0.0f && exposure == 0.0f && contrast == 1.0f &&
+               saturation == 1.0f && gamma == 1.0f && shadows == 1.0f &&
+               midtones == 1.0f && highlights == 1.0f;
+    }
+
+    [[nodiscard]] bool operator==(const ImageAdjustments&) const = default;
 };
 
 class VideoRenderer {
@@ -89,6 +125,12 @@ public:
     }
     [[nodiscard]] const ImageAdjustments& Adjustments() const noexcept { return adjustments_; }
 
+    // Recorte aplicado al dibujar. Mientras se edita conviene pasar el completo
+    // y dejar que la interfaz dibuje el rectangulo encima: recortar en vivo
+    // impediria ver lo que se esta dejando fuera.
+    void SetCrop(const CropRect& crop) noexcept { crop_ = crop; }
+    [[nodiscard]] const CropRect& Crop() const noexcept { return crop_; }
+
     void SetViewTransform(const ViewTransform& view) noexcept { view_ = view; }
     [[nodiscard]] const ViewTransform& View() const noexcept { return view_; }
 
@@ -103,6 +145,14 @@ public:
     [[nodiscard]] static RECT ComputeFitRect(unsigned targetWidth, unsigned targetHeight,
                                              int videoWidth, int videoHeight,
                                              AVRational sampleAspect) noexcept;
+
+    // Como ComputeFitRect pero teniendo en cuenta el recorte: un 16:9 recortado
+    // a su mitad derecha es 8:9, y el encuadre debe respetarlo.
+    [[nodiscard]] static RECT ComputeCroppedFitRect(unsigned targetWidth,
+                                                    unsigned targetHeight,
+                                                    int videoWidth, int videoHeight,
+                                                    AVRational sampleAspect,
+                                                    const CropRect& crop) noexcept;
 
     // Aplica zoom y desplazamiento al rectangulo ajustado. Puede devolver un
     // rectangulo mayor que la ventana: es lo que se espera al ampliar.
@@ -138,17 +188,23 @@ private:
     struct alignas(16) Constants {
         float         yuvToRgb[16];     // b0, registros 0-3
         float         uvScale[2];       // registro 4 .xy
-        float         texelSize[2];     // registro 4 .zw
+        float         uvOffset[2];      // registro 4 .zw
         std::uint32_t inputTransfer;    // registro 5 .x
         std::uint32_t outputHdr;        // registro 5 .y
         float         bitScale;         // registro 5 .z
         float         sdrWhiteNits;     // registro 5 .w
         float         srcPeakNits;      // registro 6 .x
         float         brightness;       // registro 6 .y
-        float         contrast;         // registro 6 .z
-        float         saturation;       // registro 6 .w
+        float         exposure;         // registro 6 .z
+        float         contrast;         // registro 6 .w
+        float         saturation;       // registro 7 .x
+        float         gamma;            // registro 7 .y
+        float         shadows;          // registro 7 .z
+        float         midtones;         // registro 7 .w
+        float         highlights;       // registro 8 .x
+        float         padding[3];       // registro 8 .yzw
     };
-    static_assert(sizeof(Constants) == 112, "el constant buffer debe casar con video.hlsl");
+    static_assert(sizeof(Constants) == 144, "el constant buffer debe casar con video.hlsl");
 
     struct ViewKey {
         ID3D11Texture2D* texture;
@@ -225,6 +281,7 @@ private:
     std::unordered_map<ViewKey, ComPtr<ID3D11ShaderResourceView>, ViewKeyHash> viewCache_;
 
     ImageAdjustments adjustments_{};
+    CropRect         crop_{};
     ViewTransform    view_{};
     float            sdrWhiteNits_ = 203.0f;   // BT.2408
     RECT             lastVideoRect_{};

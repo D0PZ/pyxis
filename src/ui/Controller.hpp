@@ -96,6 +96,12 @@ private:
     void RequestSnapshot();
     void TakeSnapshot();   // hilo de presentacion
 
+    // ---- Encuadre y ajustes -----------------------------------------------
+    void ToggleCropEditor();
+    void ResetCrop();
+    void DragCrop(int x, int y);
+    void ApplyFilterAt(FilterControl control, int x, int y);
+
     // ---- Recorte ----------------------------------------------------------
     void SetTrimPoint(bool isStart);
     void ClearTrim();
@@ -186,6 +192,23 @@ private:
     // Que tirador de recorte se esta arrastrando: 0 ninguno, -1 el inicio,
     // +1 el final.
     int draggingTrim_ = 0;
+
+    // Encuadre. El rectangulo se protege con el mismo cerrojo que el zoom: lo
+    // escribe la interfaz y lo lee la presentacion en cada fotograma.
+    CropRect          crop_{};
+    std::atomic<bool> cropEditing_{false};
+
+    // Estado del arrastre del encuadre. Se guarda el rectangulo de partida y el
+    // punto donde empezo, y cada movimiento se calcula desde ahi: de forma
+    // incremental el redondeo acumularia deriva.
+    CropHandle cropDragHandle_ = CropHandle::None;
+    CropRect   cropDragOrigin_{};
+    POINT      cropDragStart_{};
+
+    // Ajustes de imagen y el control que se esta arrastrando.
+    ImageAdjustments adjustments_{};
+    std::atomic<bool> filtersOpen_{false};
+    FilterControl     draggingFilter_ = FilterControl::None;
 
     // Encuadre. Lo escribe el hilo de interfaz y lo lee el de presentacion en
     // cada fotograma, de ahi el cerrojo. Es una estructura de doce bytes que se

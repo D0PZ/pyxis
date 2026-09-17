@@ -41,12 +41,17 @@ cbuffer VideoConstants : register(b0) {
     // orden de columnas por defecto, y la CPU la rellena por filas.
     row_major float4x4 c_yuvToRgb;
 
-    // Porcion util de la textura. El pool de hardware alinea las texturas a
-    // multiplos del tamano de macrobloque, asi que una imagen de 1920x1080
-    // suele vivir dentro de una textura de 1920x1088. Sin este factor se
-    // muestrearian las 8 filas de relleno.
+    // Region de la textura que se muestrea. Cubre dos cosas a la vez:
+    //
+    //   * El relleno del pool de hardware, que alinea las texturas a multiplos
+    //     del macrobloque: una imagen de 1920x1080 suele vivir dentro de una de
+    //     1920x1088, y sin corregirlo se muestrearian las 8 filas sobrantes.
+    //   * El recorte de encuadre que haya definido el usuario.
+    //
+    // Se combinan en la CPU, de modo que aqui el recorte no cuesta ni una
+    // instruccion: es el mismo producto que ya habia que hacer.
     float2 c_uvScale;
-    float2 c_texelSize;
+    float2 c_uvOffset;
 
     uint  c_inputTransfer;   // 0 = SDR, 1 = PQ, 2 = HLG
     uint  c_outputHdr;       // 0 = salida SDR sRGB, 1 = salida HDR10 PQ
@@ -54,9 +59,17 @@ cbuffer VideoConstants : register(b0) {
     float c_sdrWhiteNits;    // nits del blanco de referencia (203 por BT.2408)
 
     float c_srcPeakNits;     // pico del contenido, de los metadatos de masterizacion
-    float c_brightness;      // -1 .. +1  (desplazamiento)
-    float c_contrast;        //  0 .. +2  (1 = sin cambio)
-    float c_saturation;      //  0 .. +2  (1 = sin cambio)
+    float c_brightness;      // -1 .. +1   desplazamiento
+    float c_exposure;        // -3 .. +3   pasos de diafragma
+    float c_contrast;        //  0 .. +2   1 = sin cambio
+
+    float c_saturation;      //  0 .. +2   1 = sin cambio
+    float c_gamma;           // 0.3 .. 3   1 = sin cambio
+    float c_shadows;         //  0 .. +2   ganancia de las sombras
+    float c_midtones;        //  0 .. +2   ganancia de los medios
+
+    float c_highlights;      //  0 .. +2   ganancia de las altas luces
+    float3 c_adjustPadding;
 };
 
 struct PixelInput {
@@ -85,17 +98,69 @@ float3 TonemapReinhard(float3 color, float peak) {
 }
 
 // ---------------------------------------------------------------------------
+//  Bandas tonales
+//
+//  Tres ganancias -sombras, medios y altas luces- ponderadas por campanas que
+//  se solapan. La alternativa habitual seria una curva con puntos de control
+//  arbitrarios, pero esto da el mismo resultado practico con tres numeros y sin
+//  discontinuidades: las campanas suman aproximadamente uno en todo el rango,
+//  asi que subir las tres por igual equivale a subir el brillo, y mover solo
+//  una no crea escalones en las zonas vecinas.
+// ---------------------------------------------------------------------------
+float BandWeight(float luminance, float center, float width) {
+    const float distance = (luminance - center) / width;
+    return exp(-distance * distance);
+}
+
+float3 ApplyToneBands(float3 color) {
+    // Si las tres estan a uno no hay nada que hacer. Es el caso normal y la
+    // rama es uniforme, asi que la GPU no paga divergencia por comprobarlo.
+    if (c_shadows == 1.0f && c_midtones == 1.0f && c_highlights == 1.0f) {
+        return color;
+    }
+
+    const float luminance = dot(color, kLumaBt709);
+
+    const float weightShadow = BandWeight(luminance, 0.15f, 0.25f);
+    const float weightMid    = BandWeight(luminance, 0.50f, 0.25f);
+    const float weightHigh   = BandWeight(luminance, 0.85f, 0.25f);
+
+    const float gain = 1.0f + (c_shadows - 1.0f) * weightShadow +
+                              (c_midtones - 1.0f) * weightMid +
+                              (c_highlights - 1.0f) * weightHigh;
+
+    return color * max(gain, 0.0f);
+}
+
+// ---------------------------------------------------------------------------
 //  Ajustes de imagen del usuario
 //
-//  Se aplican en dominio de display (no lineal), que es donde el ojo espera
-//  que actuen y donde lo hacen todos los controles de un televisor.
+//  El ORDEN importa y no es arbitrario:
+//
+//    1. Exposicion, en luz LINEAL. Un paso de diafragma es una duplicacion de
+//       la luz que entra, y eso solo es cierto antes de la curva de gamma.
+//       Aplicarla sobre el valor codificado aclararia las sombras mucho mas de
+//       lo que haria una camara real.
+//    2. El resto en dominio de display, que es donde el ojo espera que actuen
+//       y donde lo hacen los controles de cualquier televisor.
 // ---------------------------------------------------------------------------
 float3 ApplyImageAdjustments(float3 color) {
+    if (c_exposure != 0.0f) {
+        float3 linearColor = SrgbToLinear(color) * exp2(c_exposure);
+        color = LinearToSrgb(linearColor);
+    }
+
+    color = ApplyToneBands(color);
+
     color += c_brightness;
     color = (color - 0.5f) * c_contrast + 0.5f;
 
     const float gray = dot(color, kLumaBt709);
     color = lerp(gray.xxx, color, c_saturation);
+
+    if (c_gamma != 1.0f) {
+        color = pow(max(color, 0.0f), 1.0f / c_gamma);
+    }
 
     return color;
 }
@@ -104,7 +169,7 @@ float3 ApplyImageAdjustments(float3 color) {
 //  Shader principal
 // ---------------------------------------------------------------------------
 float4 PSMain(PixelInput input) : SV_Target {
-    const float2 uv = input.uv * c_uvScale;
+    const float2 uv = input.uv * c_uvScale + c_uvOffset;
 
     // El croma de 4:2:0 vive en un plano de media resolucion. El muestreo
     // bilineal con las mismas coordenadas interpola entre las muestras

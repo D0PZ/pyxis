@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <cwchar>
 
@@ -36,6 +37,62 @@ constexpr float kButtonGap  = 6.0f;
 constexpr float kSpeedWidth     = 52.0f;
 constexpr float kSnapshotWidth  = 34.0f;
 constexpr float kTrimWidth      = 34.0f;
+constexpr float kCropWidth      = 34.0f;
+constexpr float kFiltersWidth   = 34.0f;
+
+// Panel de ajustes.
+constexpr float kPanelWidth      = 330.0f;
+constexpr float kPanelPadding    = 16.0f;
+constexpr float kPanelRowHeight  = 30.0f;
+constexpr float kPanelLabelWidth = 92.0f;
+constexpr float kPanelValueWidth = 46.0f;
+constexpr float kToneGraphHeight = 92.0f;
+
+// Tirador del encuadre. Grande a proposito: se manipula sobre la imagen, donde
+// no hay ninguna otra referencia visual que ayude a apuntar.
+constexpr float kCropHandleSize = 16.0f;
+constexpr float kCropGrab       = 11.0f;
+
+// Los cinco deslizadores, en el orden en que se dibujan.
+constexpr std::array<FilterControl, 5> kSliderControls = {
+    FilterControl::Exposure, FilterControl::Brightness, FilterControl::Contrast,
+    FilterControl::Saturation, FilterControl::Gamma,
+};
+
+constexpr std::array<const wchar_t*, 5> kSliderLabels = {
+    L"Exposición", L"Brillo", L"Contraste", L"Saturación", L"Gamma",
+};
+
+// Las tres bandas tonales, con su posicion en el grafico.
+constexpr std::array<FilterControl, 3> kBandControls = {
+    FilterControl::Shadows, FilterControl::Midtones, FilterControl::Highlights,
+};
+constexpr std::array<float, 3> kBandCenters = {0.15f, 0.50f, 0.85f};
+
+// Misma formula que ApplyToneBands en video.hlsl. Duplicarla es deliberado: el
+// grafico tiene que dibujar exactamente la curva que aplica la GPU, y no hay
+// forma de compartir codigo entre HLSL y C++. Si una cambia, la otra tambien.
+[[nodiscard]] float BandWeight(float luminance, float center) noexcept {
+    const float distance = (luminance - center) / 0.25f;
+    return std::exp(-distance * distance);
+}
+
+[[nodiscard]] float ToneCurve(float luminance, const ImageAdjustments& a) noexcept {
+    const float gain = 1.0f + (a.shadows - 1.0f) * BandWeight(luminance, 0.15f) +
+                              (a.midtones - 1.0f) * BandWeight(luminance, 0.50f) +
+                              (a.highlights - 1.0f) * BandWeight(luminance, 0.85f);
+    return std::clamp(luminance * std::max(gain, 0.0f), 0.0f, 1.0f);
+}
+
+[[nodiscard]] std::wstring FormatValue(FilterControl control, float value) {
+    std::array<wchar_t, 24> buffer{};
+    if (control == FilterControl::Exposure) {
+        std::swprintf(buffer.data(), buffer.size(), L"%+.1f", value);
+    } else {
+        std::swprintf(buffer.data(), buffer.size(), L"%.2f", value);
+    }
+    return buffer.data();
+}
 
 // Tirador de los puntos de recorte. Mas ancho que su dibujo: acertar con el
 // raton sobre una linea de dos pixeles es imposible.
@@ -269,6 +326,13 @@ void Overlay::CreateTextFormats() {
                  hintKeyFormat_);
     createFormat(L"Segoe UI Variable Display", 13.0f, DWRITE_FONT_WEIGHT_NORMAL,
                  hintTextFormat_);
+    createFormat(L"Segoe UI Variable Display", 13.0f, DWRITE_FONT_WEIGHT_NORMAL,
+                 panelFormat_);
+    createFormat(L"Cascadia Mono", 12.0f, DWRITE_FONT_WEIGHT_NORMAL, panelValueFormat_);
+
+    panelFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    panelValueFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    panelValueFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     controlFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     controlFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -361,6 +425,12 @@ void Overlay::Repaint() {
     } else if (model_.showControls) {
         DrawControlBar(width_, height_);
     }
+    // El editor de encuadre va DEBAJO de la barra en orden de dibujo -es decir,
+    // primero- para que los controles queden accesibles por encima de el.
+    if (model_.cropEditing && !model_.showWelcome) {
+        DrawCropEditor();
+    }
+
     // El menu se dibuja despues de la barra para quedar por encima de ella.
     if (model_.showControls && !model_.showWelcome && model_.speedMenuOpen) {
         DrawSpeedMenu();
@@ -442,7 +512,11 @@ void Overlay::DrawControlBar(unsigned width, unsigned height) {
     const float rowY = h - kButtonRowY;
 
     DrawTransport(kMargin, rowY);
-    DrawSpeedControl(w - kMargin, rowY);
+    DrawRightControls(w - kMargin, rowY);
+
+    if (model_.filtersOpen) {
+        DrawFiltersPanel(w - kMargin, h - kBarHeight - 12.0f);
+    }
 
     // El reloj arranca despues de los botones de transporte.
     const float clockLeft = stepForwardRect_.right + 16.0f;
@@ -581,8 +655,10 @@ void Overlay::DrawTransport(float left, float centerY) {
 //  no parezca un boton. Solo se insinua con un fondo muy tenue cuando el menu
 //  esta abierto, para que se entienda de donde sale el desplegable.
 // ---------------------------------------------------------------------------
-void Overlay::DrawSpeedControl(float right, float centerY) {
-    const float trimLeft     = right - kTrimWidth;
+void Overlay::DrawRightControls(float right, float centerY) {
+    const float filtersLeft  = right - kFiltersWidth;
+    const float cropLeft     = filtersLeft - kControlGap - kCropWidth;
+    const float trimLeft     = cropLeft - kControlGap - kTrimWidth;
     const float snapshotLeft = trimLeft - kControlGap - kSnapshotWidth;
     const float speedLeft    = snapshotLeft - kControlGap - kSpeedWidth;
 
@@ -592,7 +668,11 @@ void Overlay::DrawSpeedControl(float right, float centerY) {
                                 snapshotLeft + kSnapshotWidth,
                                 centerY + kControlHeight * 0.5f);
     trimRect_ = D2D1::RectF(trimLeft, centerY - kControlHeight * 0.5f,
-                            right, centerY + kControlHeight * 0.5f);
+                            trimLeft + kTrimWidth, centerY + kControlHeight * 0.5f);
+    cropButtonRect_ = D2D1::RectF(cropLeft, centerY - kControlHeight * 0.5f,
+                                  cropLeft + kCropWidth, centerY + kControlHeight * 0.5f);
+    filtersButtonRect_ = D2D1::RectF(filtersLeft, centerY - kControlHeight * 0.5f,
+                                     right, centerY + kControlHeight * 0.5f);
 
     // --- Velocidad ---------------------------------------------------------
     if (model_.speedMenuOpen) {
@@ -646,6 +726,323 @@ void Overlay::DrawSpeedControl(float right, float centerY) {
     d2dContext_->DrawEllipse(
         D2D1::Ellipse(D2D1::Point2F(trimCenter.x + 4.0f, trimCenter.y + 6.0f), 3.0f, 3.0f),
         brush_.Get(), 1.4f);
+
+    // --- Encuadre ----------------------------------------------------------
+    // Las dos escuadras cruzadas del simbolo de recorte fotografico. Se enciende
+    // cuando hay un encuadre activo o se esta editando.
+    const D2D1_POINT_2F cropCenter =
+        D2D1::Point2F((cropButtonRect_.left + cropButtonRect_.right) * 0.5f, centerY);
+
+    const bool cropActive = model_.cropEditing || !model_.crop.IsFull();
+    brush_->SetColor(model_.cropEditing ? Rgba(0.45f, 0.80f, 1.0f, 0.98f)
+                                        : Rgba(1, 1, 1, cropActive ? 0.92f : 0.72f));
+
+    d2dContext_->DrawLine(D2D1::Point2F(cropCenter.x - 4.0f, cropCenter.y - 9.0f),
+                          D2D1::Point2F(cropCenter.x - 4.0f, cropCenter.y + 5.0f),
+                          brush_.Get(), 1.5f);
+    d2dContext_->DrawLine(D2D1::Point2F(cropCenter.x - 9.0f, cropCenter.y + 4.0f),
+                          D2D1::Point2F(cropCenter.x + 5.0f, cropCenter.y + 4.0f),
+                          brush_.Get(), 1.5f);
+    d2dContext_->DrawLine(D2D1::Point2F(cropCenter.x + 4.0f, cropCenter.y - 5.0f),
+                          D2D1::Point2F(cropCenter.x + 4.0f, cropCenter.y + 9.0f),
+                          brush_.Get(), 1.5f);
+    d2dContext_->DrawLine(D2D1::Point2F(cropCenter.x - 5.0f, cropCenter.y - 4.0f),
+                          D2D1::Point2F(cropCenter.x + 9.0f, cropCenter.y - 4.0f),
+                          brush_.Get(), 1.5f);
+
+    // --- Ajustes -----------------------------------------------------------
+    // Tres deslizadores con el mando a distinta altura, el icono universal de
+    // "parametros".
+    const D2D1_POINT_2F filtersCenter =
+        D2D1::Point2F((filtersButtonRect_.left + filtersButtonRect_.right) * 0.5f, centerY);
+
+    brush_->SetColor(model_.filtersOpen ? Rgba(0.45f, 0.80f, 1.0f, 0.98f)
+                                        : Rgba(1, 1, 1,
+                                               model_.adjustments.IsNeutral() ? 0.72f : 0.92f));
+
+    static constexpr std::array<float, 3> kRows  = {-5.5f, 0.0f, 5.5f};
+    static constexpr std::array<float, 3> kKnobs = {-2.5f, 3.5f, -0.5f};
+
+    for (std::size_t i = 0; i < kRows.size(); ++i) {
+        const float y = filtersCenter.y + kRows[i];
+        d2dContext_->DrawLine(D2D1::Point2F(filtersCenter.x - 8.0f, y),
+                              D2D1::Point2F(filtersCenter.x + 8.0f, y), brush_.Get(), 1.3f);
+        d2dContext_->FillEllipse(
+            D2D1::Ellipse(D2D1::Point2F(filtersCenter.x + kKnobs[i], y), 2.4f, 2.4f),
+            brush_.Get());
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Editor de encuadre
+//
+//  El video se sigue viendo ENTERO y lo que queda fuera del rectangulo se
+//  atenua. Recortar en vivo mientras se ajusta seria contraproducente: para
+//  decidir un encuadre hay que ver lo que se esta dejando fuera.
+// ---------------------------------------------------------------------------
+void Overlay::DrawCropEditor() {
+    if (!model_.videoRect.Valid()) return;
+
+    const ScreenRect area = CropScreenRect();
+    if (!area.Valid()) return;
+
+    const ScreenRect& video = model_.videoRect;
+
+    // Atenuado de las cuatro franjas exteriores. Cuatro rectangulos en vez de
+    // uno con agujero: no hace falta geometria recortada para esto.
+    brush_->SetColor(Rgba(0, 0, 0, 0.58f));
+    d2dContext_->FillRectangle(D2D1::RectF(video.left, video.top, video.right, area.top),
+                               brush_.Get());
+    d2dContext_->FillRectangle(
+        D2D1::RectF(video.left, area.bottom, video.right, video.bottom), brush_.Get());
+    d2dContext_->FillRectangle(D2D1::RectF(video.left, area.top, area.left, area.bottom),
+                               brush_.Get());
+    d2dContext_->FillRectangle(D2D1::RectF(area.right, area.top, video.right, area.bottom),
+                               brush_.Get());
+
+    // Regla de los tercios dentro del encuadre: es la referencia con la que se
+    // compone un plano, y tenerla delante mientras se ajusta es media ayuda.
+    brush_->SetColor(Rgba(1, 1, 1, 0.20f));
+    for (int i = 1; i <= 2; ++i) {
+        const float fraction = static_cast<float>(i) / 3.0f;
+        const float x = area.left + area.Width() * fraction;
+        const float y = area.top + area.Height() * fraction;
+        d2dContext_->DrawLine(D2D1::Point2F(x, area.top), D2D1::Point2F(x, area.bottom),
+                              brush_.Get(), 1.0f);
+        d2dContext_->DrawLine(D2D1::Point2F(area.left, y), D2D1::Point2F(area.right, y),
+                              brush_.Get(), 1.0f);
+    }
+
+    // Marco.
+    brush_->SetColor(Rgba(1, 1, 1, 0.95f));
+    d2dContext_->DrawRectangle(
+        D2D1::RectF(area.left, area.top, area.right, area.bottom), brush_.Get(), 1.6f);
+
+    // Tiradores: ocho cuadrados, cuatro en las esquinas y cuatro en los puntos
+    // medios de cada lado.
+    const float half = kCropHandleSize * 0.5f;
+    const std::array<D2D1_POINT_2F, 8> handles = {
+        D2D1::Point2F(area.left, area.top),
+        D2D1::Point2F((area.left + area.right) * 0.5f, area.top),
+        D2D1::Point2F(area.right, area.top),
+        D2D1::Point2F(area.left, (area.top + area.bottom) * 0.5f),
+        D2D1::Point2F(area.right, (area.top + area.bottom) * 0.5f),
+        D2D1::Point2F(area.left, area.bottom),
+        D2D1::Point2F((area.left + area.right) * 0.5f, area.bottom),
+        D2D1::Point2F(area.right, area.bottom),
+    };
+
+    for (const D2D1_POINT_2F& handle : handles) {
+        const D2D1_RECT_F box = D2D1::RectF(handle.x - half, handle.y - half,
+                                            handle.x + half, handle.y + half);
+        brush_->SetColor(Rgba(0.05f, 0.07f, 0.10f, 0.85f));
+        d2dContext_->FillRoundedRectangle(D2D1::RoundedRect(box, 3.0f, 3.0f), brush_.Get());
+        brush_->SetColor(Rgba(0.45f, 0.80f, 1.0f, 0.98f));
+        d2dContext_->DrawRoundedRectangle(D2D1::RoundedRect(box, 3.0f, 3.0f),
+                                          brush_.Get(), 1.8f);
+    }
+
+    // Dimensiones resultantes, para que el encuadre se pueda ajustar a un
+    // tamano concreto y no solo a ojo.
+    std::array<wchar_t, 64> caption{};
+    std::swprintf(caption.data(), caption.size(), L"%.0f %%  x  %.0f %%",
+                  model_.crop.Width() * 100.0f, model_.crop.Height() * 100.0f);
+
+    // La etiqueta va encima del marco, salvo que no quepa: entonces baja a su
+    // interior. Con un encuadre pegado al borde superior, fuera quedaria
+    // recortada por la propia ventana.
+    const bool fitsAbove = area.top - 30.0f >= video.top;
+    const float badgeTop = fitsAbove ? area.top - 30.0f : area.top + 6.0f;
+
+    brush_->SetColor(Rgba(0, 0, 0, 0.65f));
+    const D2D1_RECT_F badge =
+        D2D1::RectF(area.left + (fitsAbove ? 0.0f : 6.0f), badgeTop,
+                    area.left + (fitsAbove ? 128.0f : 134.0f), badgeTop + 24.0f);
+    d2dContext_->FillRoundedRectangle(D2D1::RoundedRect(badge, 5.0f, 5.0f), brush_.Get());
+
+    brush_->SetColor(Rgba(1, 1, 1, 0.92f));
+    d2dContext_->DrawTextW(caption.data(),
+                           static_cast<UINT32>(std::wcslen(caption.data())),
+                           controlFormat_.Get(), badge, brush_.Get());
+}
+
+ScreenRect Overlay::CropScreenRect() const noexcept {
+    const ScreenRect& video = model_.videoRect;
+    if (!video.Valid()) return {};
+
+    return ScreenRect{video.left + video.Width() * model_.crop.left,
+                      video.top + video.Height() * model_.crop.top,
+                      video.left + video.Width() * model_.crop.right,
+                      video.top + video.Height() * model_.crop.bottom};
+}
+
+// ---------------------------------------------------------------------------
+//  Panel de ajustes de imagen
+// ---------------------------------------------------------------------------
+void Overlay::DrawFiltersPanel(float right, float bottom) {
+    const float height = kPanelPadding * 2.0f +
+                         kPanelRowHeight * static_cast<float>(kSliderControls.size()) +
+                         kToneGraphHeight + 58.0f;
+
+    const float left = right - kPanelWidth;
+    const float top  = bottom - height;
+
+    filtersPanelRect_ = D2D1::RectF(left, top, right, bottom);
+
+    brush_->SetColor(Rgba(0.05f, 0.07f, 0.10f, 0.94f));
+    d2dContext_->FillRoundedRectangle(D2D1::RoundedRect(filtersPanelRect_, 10.0f, 10.0f),
+                                      brush_.Get());
+    brush_->SetColor(Rgba(1, 1, 1, 0.14f));
+    d2dContext_->DrawRoundedRectangle(D2D1::RoundedRect(filtersPanelRect_, 10.0f, 10.0f),
+                                      brush_.Get(), 1.0f);
+
+    // --- Deslizadores ------------------------------------------------------
+    const float trackLeft  = left + kPanelPadding + kPanelLabelWidth;
+    const float trackRight = right - kPanelPadding - kPanelValueWidth;
+
+    for (std::size_t i = 0; i < kSliderControls.size(); ++i) {
+        const FilterControl control = kSliderControls[i];
+        const FilterRange   range   = FilterRangeFor(control);
+        const float value = FilterValueOf(model_.adjustments, control);
+
+        const float rowTop = top + kPanelPadding + kPanelRowHeight * static_cast<float>(i);
+        const float rowY   = rowTop + kPanelRowHeight * 0.5f;
+
+        sliderTracks_[i] = D2D1::RectF(trackLeft, rowY - 9.0f, trackRight, rowY + 9.0f);
+
+        brush_->SetColor(Rgba(1, 1, 1, 0.70f));
+        d2dContext_->DrawTextW(kSliderLabels[i],
+                               static_cast<UINT32>(std::wcslen(kSliderLabels[i])),
+                               panelFormat_.Get(),
+                               D2D1::RectF(left + kPanelPadding, rowTop,
+                                           trackLeft - 8.0f, rowTop + kPanelRowHeight),
+                               brush_.Get());
+
+        // Pista.
+        brush_->SetColor(Rgba(1, 1, 1, 0.16f));
+        d2dContext_->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(trackLeft, rowY - 2.0f, trackRight, rowY + 2.0f),
+                              2.0f, 2.0f),
+            brush_.Get());
+
+        const float fraction =
+            std::clamp((value - range.minimum) / (range.maximum - range.minimum), 0.0f, 1.0f);
+        const float knobX = trackLeft + (trackRight - trackLeft) * fraction;
+
+        // Marca del valor neutro: sin ella no hay forma de volver al centro a
+        // ojo, y es justo el punto al que se quiere volver.
+        const float neutralValue = control == FilterControl::Exposure ||
+                                           control == FilterControl::Brightness
+                                       ? 0.0f
+                                       : 1.0f;
+        const float neutralFraction = std::clamp(
+            (neutralValue - range.minimum) / (range.maximum - range.minimum), 0.0f, 1.0f);
+        const float neutralX = trackLeft + (trackRight - trackLeft) * neutralFraction;
+
+        brush_->SetColor(Rgba(1, 1, 1, 0.30f));
+        d2dContext_->FillRectangle(
+            D2D1::RectF(neutralX - 0.6f, rowY - 6.0f, neutralX + 0.6f, rowY + 6.0f),
+            brush_.Get());
+
+        // Tramo recorrido desde el neutro, para leer de un vistazo hacia donde
+        // se ha movido.
+        brush_->SetColor(Rgba(0.35f, 0.72f, 1.0f, 0.85f));
+        d2dContext_->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(std::min(neutralX, knobX), rowY - 2.0f,
+                                          std::max(neutralX, knobX), rowY + 2.0f),
+                              2.0f, 2.0f),
+            brush_.Get());
+
+        brush_->SetColor(Rgba(1, 1, 1, 0.96f));
+        d2dContext_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knobX, rowY), 6.0f, 6.0f),
+                                 brush_.Get());
+
+        brush_->SetColor(Rgba(1, 1, 1, 0.80f));
+        const std::wstring text = FormatValue(control, value);
+        d2dContext_->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()),
+                               panelValueFormat_.Get(),
+                               D2D1::RectF(trackRight + 8.0f, rowTop, right - kPanelPadding,
+                                           rowTop + kPanelRowHeight),
+                               brush_.Get());
+    }
+
+    // --- Grafico de bandas tonales ------------------------------------------
+    const float graphTop = top + kPanelPadding +
+                           kPanelRowHeight * static_cast<float>(kSliderControls.size()) + 8.0f;
+    toneGraphRect_ = D2D1::RectF(left + kPanelPadding, graphTop,
+                                 right - kPanelPadding, graphTop + kToneGraphHeight);
+
+    brush_->SetColor(Rgba(1, 1, 1, 0.07f));
+    d2dContext_->FillRoundedRectangle(D2D1::RoundedRect(toneGraphRect_, 6.0f, 6.0f),
+                                      brush_.Get());
+    brush_->SetColor(Rgba(1, 1, 1, 0.12f));
+    d2dContext_->DrawRoundedRectangle(D2D1::RoundedRect(toneGraphRect_, 6.0f, 6.0f),
+                                      brush_.Get(), 1.0f);
+
+    // Diagonal de referencia: es la curva sin tocar, y sirve para ver de un
+    // golpe cuanto se ha desviado el ajuste.
+    brush_->SetColor(Rgba(1, 1, 1, 0.18f));
+    d2dContext_->DrawLine(D2D1::Point2F(toneGraphRect_.left, toneGraphRect_.bottom),
+                          D2D1::Point2F(toneGraphRect_.right, toneGraphRect_.top),
+                          brush_.Get(), 1.0f);
+
+    // Curva resultante, muestreada.
+    const float graphWidth  = toneGraphRect_.right - toneGraphRect_.left;
+    const float graphHeight = toneGraphRect_.bottom - toneGraphRect_.top;
+
+    brush_->SetColor(Rgba(0.45f, 0.80f, 1.0f, 0.95f));
+    constexpr int kSamples = 48;
+    D2D1_POINT_2F previous{};
+    for (int i = 0; i <= kSamples; ++i) {
+        const float input = static_cast<float>(i) / kSamples;
+        const float output = ToneCurve(input, model_.adjustments);
+
+        const D2D1_POINT_2F point =
+            D2D1::Point2F(toneGraphRect_.left + graphWidth * input,
+                          toneGraphRect_.bottom - graphHeight * output);
+        if (i > 0) d2dContext_->DrawLine(previous, point, brush_.Get(), 1.8f);
+        previous = point;
+    }
+
+    // Los tres puntos de control se dibujan SOBRE la curva, en la altura que
+    // esa banda produce. Colocarlos a una altura independiente los dejaria
+    // flotando al margen del trazo que representan, que es justo lo que un
+    // editor de curvas no debe hacer: el punto ES la curva en ese tono.
+    for (std::size_t i = 0; i < kBandControls.size(); ++i) {
+        const float center = kBandCenters[i];
+        const float output = ToneCurve(center, model_.adjustments);
+
+        const D2D1_POINT_2F point =
+            D2D1::Point2F(toneGraphRect_.left + graphWidth * center,
+                          toneGraphRect_.bottom - graphHeight * output);
+
+        brush_->SetColor(Rgba(0.05f, 0.07f, 0.10f, 0.9f));
+        d2dContext_->FillEllipse(D2D1::Ellipse(point, 7.0f, 7.0f), brush_.Get());
+        brush_->SetColor(Rgba(1.0f, 0.72f, 0.24f, 0.98f));
+        d2dContext_->FillEllipse(D2D1::Ellipse(point, 4.5f, 4.5f), brush_.Get());
+    }
+
+    static constexpr std::wstring_view kBandCaption = L"sombras        medios        altas luces";
+    brush_->SetColor(Rgba(1, 1, 1, 0.45f));
+    d2dContext_->DrawTextW(kBandCaption.data(), static_cast<UINT32>(kBandCaption.size()),
+                           hintTextFormat_.Get(),
+                           D2D1::RectF(toneGraphRect_.left, toneGraphRect_.bottom + 2.0f,
+                                       toneGraphRect_.right, toneGraphRect_.bottom + 22.0f),
+                           brush_.Get());
+
+    // --- Restablecer --------------------------------------------------------
+    resetRect_ = D2D1::RectF(left + kPanelPadding, bottom - kPanelPadding - 26.0f,
+                             right - kPanelPadding, bottom - kPanelPadding);
+
+    const bool neutral = model_.adjustments.IsNeutral();
+    brush_->SetColor(Rgba(1, 1, 1, neutral ? 0.06f : 0.14f));
+    d2dContext_->FillRoundedRectangle(D2D1::RoundedRect(resetRect_, 6.0f, 6.0f),
+                                      brush_.Get());
+
+    static constexpr std::wstring_view kReset = L"Restablecer";
+    brush_->SetColor(Rgba(1, 1, 1, neutral ? 0.35f : 0.88f));
+    d2dContext_->DrawTextW(kReset.data(), static_cast<UINT32>(kReset.size()),
+                           controlFormat_.Get(), resetRect_, brush_.Get());
 }
 
 void Overlay::DrawSpeedMenu() {
@@ -852,7 +1249,8 @@ void Overlay::Render(SwapChain& swapChain) {
     if (!surfaceView_) return;
 
     const bool hasContent = model_.showWelcome || model_.showControls ||
-                            model_.showStats || !model_.toast.empty();
+                            model_.cropEditing || model_.showStats ||
+                            !model_.toast.empty();
     if (!hasContent) return;
 
     if (dirty_) Repaint();
@@ -915,6 +1313,124 @@ bool Overlay::HitTestStepBack(int x, int y) const noexcept {
 bool Overlay::HitTestStepForward(int x, int y) const noexcept {
     if (!model_.showControls || model_.showWelcome) return false;
     return Contains(stepForwardRect_, static_cast<float>(x), static_cast<float>(y));
+}
+
+bool Overlay::HitTestCropButton(int x, int y) const noexcept {
+    if (!model_.showControls || model_.showWelcome) return false;
+    return Contains(cropButtonRect_, static_cast<float>(x), static_cast<float>(y));
+}
+
+bool Overlay::HitTestFiltersButton(int x, int y) const noexcept {
+    if (!model_.showControls || model_.showWelcome) return false;
+    return Contains(filtersButtonRect_, static_cast<float>(x), static_cast<float>(y));
+}
+
+CropHandle Overlay::HitTestCrop(int x, int y) const noexcept {
+    if (!model_.cropEditing || model_.showWelcome) return CropHandle::None;
+
+    const ScreenRect area = CropScreenRect();
+    if (!area.Valid()) return CropHandle::None;
+
+    const auto px = static_cast<float>(x);
+    const auto py = static_cast<float>(y);
+
+    const bool nearLeft   = std::abs(px - area.left) <= kCropGrab;
+    const bool nearRight  = std::abs(px - area.right) <= kCropGrab;
+    const bool nearTop    = std::abs(py - area.top) <= kCropGrab;
+    const bool nearBottom = std::abs(py - area.bottom) <= kCropGrab;
+
+    const bool insideX = px >= area.left - kCropGrab && px <= area.right + kCropGrab;
+    const bool insideY = py >= area.top - kCropGrab && py <= area.bottom + kCropGrab;
+    if (!insideX || !insideY) return CropHandle::None;
+
+    // Las esquinas ganan a los lados: cuando el puntero esta en una zona donde
+    // ambos aplican, redimensionar en dos ejes es lo que se espera.
+    if (nearLeft && nearTop)     return CropHandle::TopLeft;
+    if (nearRight && nearTop)    return CropHandle::TopRight;
+    if (nearLeft && nearBottom)  return CropHandle::BottomLeft;
+    if (nearRight && nearBottom) return CropHandle::BottomRight;
+
+    if (nearLeft)   return CropHandle::Left;
+    if (nearRight)  return CropHandle::Right;
+    if (nearTop)    return CropHandle::Top;
+    if (nearBottom) return CropHandle::Bottom;
+
+    if (px > area.left && px < area.right && py > area.top && py < area.bottom) {
+        return CropHandle::Move;
+    }
+    return CropHandle::None;
+}
+
+FilterControl Overlay::HitTestFilters(int x, int y) const noexcept {
+    if (!model_.filtersOpen || !model_.showControls || model_.showWelcome) {
+        return FilterControl::None;
+    }
+
+    const auto px = static_cast<float>(x);
+    const auto py = static_cast<float>(y);
+    if (!Contains(filtersPanelRect_, px, py)) return FilterControl::None;
+
+    if (Contains(resetRect_, px, py)) return FilterControl::Reset;
+
+    for (std::size_t i = 0; i < kSliderControls.size(); ++i) {
+        if (Contains(sliderTracks_[i], px, py)) return kSliderControls[i];
+    }
+
+    // Dentro del grafico manda el punto de control mas cercano en horizontal.
+    if (Contains(toneGraphRect_, px, py)) {
+        const float width = toneGraphRect_.right - toneGraphRect_.left;
+        if (width <= 0.0f) return FilterControl::None;
+
+        const float fraction = (px - toneGraphRect_.left) / width;
+
+        std::size_t best = 0;
+        float bestDistance = 2.0f;
+        for (std::size_t i = 0; i < kBandCenters.size(); ++i) {
+            const float distance = std::abs(fraction - kBandCenters[i]);
+            if (distance < bestDistance) { bestDistance = distance; best = i; }
+        }
+        return kBandControls[best];
+    }
+
+    // El clic ha caido en el panel pero no sobre un control: se consume igual,
+    // para que no se propague al video que hay debajo.
+    return FilterControl::None;
+}
+
+float Overlay::FilterValueAt(FilterControl control, int x, int y) const noexcept {
+    const FilterRange range = FilterRangeFor(control);
+
+    // Las bandas se manipulan en VERTICAL sobre el grafico; los deslizadores en
+    // horizontal. Es la diferencia entre "subir las luces" y "mover un mando".
+    //
+    // El valor no es la altura sin mas, sino la altura DIVIDIDA por el tono de
+    // la banda: arrastrar el punto de las sombras hasta el doble de su altura
+    // significa ganancia dos, igual que hacerlo con el de las altas luces. Asi
+    // el punto sigue al cursor en lugar de desplazarse una fraccion.
+    for (std::size_t i = 0; i < kBandControls.size(); ++i) {
+        if (kBandControls[i] != control) continue;
+
+        const float height = toneGraphRect_.bottom - toneGraphRect_.top;
+        if (height <= 0.0f) return range.minimum;
+
+        const float target =
+            std::clamp((toneGraphRect_.bottom - static_cast<float>(y)) / height, 0.0f, 1.0f);
+
+        return std::clamp(target / kBandCenters[i], range.minimum, range.maximum);
+    }
+
+    for (std::size_t i = 0; i < kSliderControls.size(); ++i) {
+        if (kSliderControls[i] != control) continue;
+
+        const D2D1_RECT_F& track = sliderTracks_[i];
+        const float width = track.right - track.left;
+        if (width <= 0.0f) return range.minimum;
+
+        const float fraction =
+            std::clamp((static_cast<float>(x) - track.left) / width, 0.0f, 1.0f);
+        return range.minimum + (range.maximum - range.minimum) * fraction;
+    }
+    return range.minimum;
 }
 
 bool Overlay::HitTestTrim(int x, int y) const noexcept {
@@ -990,6 +1506,8 @@ void Overlay::Destroy() noexcept {
 
     dashedStroke_.Reset();
     triangleGeometry_.Reset();
+    panelValueFormat_.Reset();
+    panelFormat_.Reset();
     hintTextFormat_.Reset();
     hintKeyFormat_.Reset();
     welcomeBodyFormat_.Reset();

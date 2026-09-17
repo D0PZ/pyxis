@@ -279,6 +279,17 @@ void Controller::PresentOneFrame() {
 
     if (currentFrame_.IsValid()) {
         videoRenderer_.SetViewTransform(CurrentView());
+
+        // Mientras se edita el encuadre el video se dibuja ENTERO: hay que ver
+        // lo que se esta dejando fuera para poder decidirlo.
+        {
+            std::lock_guard<std::mutex> lock(viewMutex_);
+            videoRenderer_.SetCrop(cropEditing_.load(std::memory_order_relaxed)
+                                       ? CropRect{}
+                                       : crop_);
+            videoRenderer_.SetAdjustments(adjustments_);
+        }
+
         videoRenderer_.Draw(swapChain_, currentFrame_, player_.SampleAspectRatio());
     } else {
         videoRenderer_.Clear(swapChain_);
@@ -501,6 +512,22 @@ void Controller::BuildOverlayModel(OverlayModel& model) {
     // que controlar y una ventana negra no explica nada.
     model.showWelcome = player_.State() == PlayerState::Idle;
     model.showStats   = showStats_.load(std::memory_order_relaxed) && !model.showWelcome;
+    {
+        std::lock_guard<std::mutex> lock(viewMutex_);
+        model.crop        = crop_;
+        model.adjustments = adjustments_;
+    }
+    model.cropEditing = cropEditing_.load(std::memory_order_relaxed);
+    model.filtersOpen = filtersOpen_.load(std::memory_order_relaxed);
+
+    // Donde se esta dibujando el fotograma, para que el editor de encuadre sepa
+    // sobre que superficie colocarse.
+    const RECT drawn = videoRenderer_.LastVideoRect();
+    model.videoRect = ScreenRect{static_cast<float>(drawn.left),
+                                 static_cast<float>(drawn.top),
+                                 static_cast<float>(drawn.right),
+                                 static_cast<float>(drawn.bottom)};
+
     model.trimStart = trimStart_.load(std::memory_order_relaxed);
     model.trimEnd   = trimEnd_.load(std::memory_order_relaxed);
     model.trimBusy  = trimBusy_.load(std::memory_order_relaxed);
@@ -511,7 +538,8 @@ void Controller::BuildOverlayModel(OverlayModel& model) {
     // Los controles permanecen visibles si esta en pausa: ocultar la barra en
     // pausa obliga a mover el raton para saber donde se quedo la reproduccion.
     const bool trimPinned = model.trimBusy || model.trimStart != kNoTimestamp ||
-                            model.trimEnd != kNoTimestamp;
+                            model.trimEnd != kNoTimestamp ||
+                            model.cropEditing || model.filtersOpen;
 
     model.showControls = !model.showWelcome &&
                          (model.paused || model.speedMenuOpen || trimPinned ||
@@ -606,6 +634,115 @@ void Controller::ApplySpeedIndex(int index) {
 }
 
 // ---------------------------------------------------------------------------
+//  Encuadre
+// ---------------------------------------------------------------------------
+void Controller::ToggleCropEditor() {
+    if (!player_.HasVideo()) return;
+
+    const bool editing = !cropEditing_.load(std::memory_order_relaxed);
+    cropEditing_.store(editing, std::memory_order_relaxed);
+
+    if (editing) {
+        // Al entrar sin encuadre previo se parte del fotograma completo, que es
+        // el punto de partida natural para empezar a cerrar el marco.
+        std::lock_guard<std::mutex> lock(viewMutex_);
+        if (crop_.IsFull()) crop_ = CropRect{};
+        ShowToast(L"Encuadre: arrastra las esquinas");
+    } else {
+        ShowToast(L"Encuadre aplicado");
+    }
+    NoteUserActivity();
+}
+
+void Controller::ResetCrop() {
+    {
+        std::lock_guard<std::mutex> lock(viewMutex_);
+        crop_ = CropRect{};
+    }
+    ShowToast(L"Encuadre completo");
+    NoteUserActivity();
+}
+
+void Controller::DragCrop(int x, int y) {
+    const ScreenRect video = [&] {
+        const RECT drawn = videoRenderer_.LastVideoRect();
+        return ScreenRect{static_cast<float>(drawn.left), static_cast<float>(drawn.top),
+                          static_cast<float>(drawn.right), static_cast<float>(drawn.bottom)};
+    }();
+    if (!video.Valid()) return;
+
+    // Desplazamiento en coordenadas NORMALIZADAS del fotograma, calculado desde
+    // el punto donde empezo el arrastre.
+    const float deltaX = static_cast<float>(x - cropDragStart_.x) / video.Width();
+    const float deltaY = static_cast<float>(y - cropDragStart_.y) / video.Height();
+
+    // Lado minimo: por debajo, los tiradores se solapan y el marco se vuelve
+    // imposible de manejar.
+    constexpr float kMinimum = 0.04f;
+
+    CropRect next = cropDragOrigin_;
+
+    const auto moveLeft   = [&] { next.left   = std::clamp(cropDragOrigin_.left + deltaX,
+                                                           0.0f, next.right - kMinimum); };
+    const auto moveRight  = [&] { next.right  = std::clamp(cropDragOrigin_.right + deltaX,
+                                                           next.left + kMinimum, 1.0f); };
+    const auto moveTop    = [&] { next.top    = std::clamp(cropDragOrigin_.top + deltaY,
+                                                           0.0f, next.bottom - kMinimum); };
+    const auto moveBottom = [&] { next.bottom = std::clamp(cropDragOrigin_.bottom + deltaY,
+                                                           next.top + kMinimum, 1.0f); };
+
+    switch (cropDragHandle_) {
+        case CropHandle::TopLeft:     moveLeft();  moveTop();    break;
+        case CropHandle::Top:         moveTop();                 break;
+        case CropHandle::TopRight:    moveRight(); moveTop();    break;
+        case CropHandle::Left:        moveLeft();                break;
+        case CropHandle::Right:       moveRight();               break;
+        case CropHandle::BottomLeft:  moveLeft();  moveBottom(); break;
+        case CropHandle::Bottom:      moveBottom();              break;
+        case CropHandle::BottomRight: moveRight(); moveBottom(); break;
+
+        case CropHandle::Move: {
+            // Al desplazar el marco entero se limita el movimiento en lugar de
+            // deformarlo: encoger el encuadre al llegar al borde no es lo que
+            // nadie espera de arrastrar.
+            const float width  = cropDragOrigin_.Width();
+            const float height = cropDragOrigin_.Height();
+
+            next.left   = std::clamp(cropDragOrigin_.left + deltaX, 0.0f, 1.0f - width);
+            next.top    = std::clamp(cropDragOrigin_.top + deltaY, 0.0f, 1.0f - height);
+            next.right  = next.left + width;
+            next.bottom = next.top + height;
+            break;
+        }
+
+        case CropHandle::None:
+            return;
+    }
+
+    std::lock_guard<std::mutex> lock(viewMutex_);
+    crop_ = next;
+}
+
+void Controller::ApplyFilterAt(FilterControl control, int x, int y) {
+    if (control == FilterControl::None) return;
+
+    if (control == FilterControl::Reset) {
+        {
+            std::lock_guard<std::mutex> lock(viewMutex_);
+            adjustments_ = ImageAdjustments{};
+        }
+        ShowToast(L"Ajustes restablecidos");
+        NoteUserActivity();
+        return;
+    }
+
+    const float value = overlay_.FilterValueAt(control, x, y);
+
+    std::lock_guard<std::mutex> lock(viewMutex_);
+    SetFilterValue(adjustments_, control, value);
+}
+
+// ---------------------------------------------------------------------------
 //  Recorte
 // ---------------------------------------------------------------------------
 Micros Controller::SeekBarPositionAt(int x, int y) const {
@@ -658,6 +795,20 @@ void Controller::StartTrim() {
         return;
     }
     if (currentPath_.empty()) return;
+
+    // El recorte temporal copia el flujo tal cual, asi que NO puede llevarse el
+    // encuadre ni los ajustes de imagen: eso exigiria decodificar y volver a
+    // codificar. Antes que entregar en silencio un archivo que no es el que se
+    // ve en pantalla, se avisa.
+    bool hasEdits = false;
+    {
+        std::lock_guard<std::mutex> lock(viewMutex_);
+        hasEdits = !crop_.IsFull() || !adjustments_.IsNeutral();
+    }
+    if (hasEdits) {
+        ShowToast(L"Aviso: el recorte conserva el vídeo original, "
+                  L"sin el encuadre ni los ajustes");
+    }
 
     // Solo puede haber una exportacion a la vez, y el hilo anterior tiene que
     // estar recogido antes de lanzar otro.
@@ -811,10 +962,18 @@ void Controller::OnKeyDown(int virtualKey, bool shift, bool control, bool repeat
             break;
 
         case VK_ESCAPE:
+            // Escape cierra lo que haya abierto, de dentro hacia fuera, y solo
+            // sale de pantalla completa cuando no queda nada mas que cerrar.
             if (speedMenuOpen_.load(std::memory_order_relaxed)) {
                 speedMenuOpen_.store(false, std::memory_order_relaxed);
-        trimStart_.store(kNoTimestamp, std::memory_order_relaxed);
-        trimEnd_.store(kNoTimestamp, std::memory_order_relaxed);
+                break;
+            }
+            if (filtersOpen_.load(std::memory_order_relaxed)) {
+                filtersOpen_.store(false, std::memory_order_relaxed);
+                break;
+            }
+            if (cropEditing_.load(std::memory_order_relaxed)) {
+                cropEditing_.store(false, std::memory_order_relaxed);
                 break;
             }
             if (window_.IsFullscreen()) window_.SetFullscreen(false);
@@ -833,6 +992,18 @@ void Controller::OnKeyDown(int virtualKey, bool shift, bool control, bool repeat
         case 'C':
             ClearTrim();
             ShowToast(L"Recorte descartado");
+            break;
+
+        case 'E':
+            ToggleCropEditor();
+            break;
+        case 'R':
+            ResetCrop();
+            break;
+        case 'G':
+            filtersOpen_.store(!filtersOpen_.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+            NoteUserActivity();
             break;
 
         case 'I':
@@ -892,6 +1063,8 @@ void Controller::OnFocusLost() {
     stepDirection_.store(0, std::memory_order_relaxed);
     leftButtonDown_ = false;
     draggingTrim_   = 0;
+    cropDragHandle_ = CropHandle::None;
+    draggingFilter_ = FilterControl::None;
     seeking_.store(false, std::memory_order_relaxed);
 }
 
@@ -906,6 +1079,16 @@ void Controller::OnMouseMove(int x, int y) {
 
     // Arrastre de la barra de progreso: se busca en vivo para que el usuario
     // vea a donde va, en lugar de saltar solo al soltar.
+    if (draggingFilter_ != FilterControl::None) {
+        ApplyFilterAt(draggingFilter_, x, y);
+        return;
+    }
+
+    if (cropDragHandle_ != CropHandle::None) {
+        DragCrop(x, y);
+        return;
+    }
+
     if (draggingTrim_ != 0) {
         const Micros target = SeekBarPositionAt(x, y);
         if (target != kNoTimestamp) {
@@ -998,6 +1181,35 @@ void Controller::OnLeftButtonDown(int x, int y) {
         StartTrim();
         return;
     }
+    if (overlay_.HitTestCropButton(x, y)) {
+        ToggleCropEditor();
+        return;
+    }
+    if (overlay_.HitTestFiltersButton(x, y)) {
+        filtersOpen_.store(!filtersOpen_.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+        return;
+    }
+
+    // El panel de ajustes se queda con todo lo que caiga dentro, incluidos los
+    // huecos: si no, un clic entre dos deslizadores pausaria el video.
+    const FilterControl filter = overlay_.HitTestFilters(x, y);
+    if (filter != FilterControl::None) {
+        draggingFilter_ = filter;
+        ApplyFilterAt(filter, x, y);
+        return;
+    }
+    // Tiradores del encuadre, antes que cualquier accion sobre el video.
+    const CropHandle handle = overlay_.HitTestCrop(x, y);
+    if (handle != CropHandle::None) {
+        cropDragHandle_ = handle;
+        cropDragStart_  = POINT{x, y};
+        {
+            std::lock_guard<std::mutex> lock(viewMutex_);
+            cropDragOrigin_ = crop_;
+        }
+        return;
+    }
 
     // Los tiradores del recorte tienen prioridad sobre la barra de progreso:
     // estan encima de ella y arrastrarlos no debe mover la reproduccion.
@@ -1027,6 +1239,15 @@ void Controller::OnLeftButtonDown(int x, int y) {
 }
 
 void Controller::OnLeftButtonUp(int, int) {
+    if (draggingFilter_ != FilterControl::None) {
+        draggingFilter_ = FilterControl::None;
+        return;
+    }
+    if (cropDragHandle_ != CropHandle::None) {
+        cropDragHandle_ = CropHandle::None;
+        return;
+    }
+
     if (draggingTrim_ != 0) {
         draggingTrim_ = 0;
         return;
@@ -1082,6 +1303,11 @@ void Controller::OnRightButtonDown(int x, int y) {
         return;
     }
 
+    if (overlay_.HitTestCropButton(x, y)) {
+        ResetCrop();
+        return;
+    }
+
     // Clic derecho sobre la tijera: descarta la seleccion. Es la accion opuesta
     // a la del clic izquierdo y va en el mismo sitio, que es donde se busca.
     if (overlay_.HitTestTrim(x, y)) {
@@ -1127,6 +1353,17 @@ void Controller::OpenMedia(const std::wstring& path) {
         scrubPosition_.store(kNoTimestamp, std::memory_order_relaxed);
         stepDirection_.store(0, std::memory_order_relaxed);
         speedMenuOpen_.store(false, std::memory_order_relaxed);
+
+        // El recorte y el encuadre pertenecen al medio anterior. Los ajustes de
+        // imagen NO se tocan: son una preferencia de visualizacion del usuario,
+        // no una propiedad del archivo.
+        trimStart_.store(kNoTimestamp, std::memory_order_relaxed);
+        trimEnd_.store(kNoTimestamp, std::memory_order_relaxed);
+        cropEditing_.store(false, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(viewMutex_);
+            crop_ = CropRect{};
+        }
 
         player_.Close();
         player_.Open(path);

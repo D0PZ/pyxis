@@ -20,6 +20,7 @@
 #include "core/Clock.hpp"
 #include "render/Device.hpp"
 #include "render/SwapChain.hpp"
+#include "render/VideoRenderer.hpp"
 
 #include <d2d1_1.h>
 #include <dwrite_1.h>
@@ -32,6 +33,90 @@ namespace pyxis {
 // Velocidades de reproduccion disponibles, en milesimas. El orden es el del
 // ciclo al pulsar el indicador, y tambien el del menu contextual.
 inline constexpr std::array<int, 6> kPlaybackRates = {250, 500, 750, 1000, 1500, 2000};
+
+// Rectangulo en pixeles de cliente. No se usa RECT de Win32 porque el modelo de
+// la superposicion se compara entero con `operator==` para decidir si repintar,
+// y RECT no es comparable.
+struct ScreenRect {
+    float left   = 0.0f;
+    float top    = 0.0f;
+    float right  = 0.0f;
+    float bottom = 0.0f;
+
+    [[nodiscard]] float Width() const noexcept { return right - left; }
+    [[nodiscard]] float Height() const noexcept { return bottom - top; }
+    [[nodiscard]] bool  Valid() const noexcept { return right > left && bottom > top; }
+
+    [[nodiscard]] bool operator==(const ScreenRect&) const = default;
+};
+
+// Que parte del rectangulo de encuadre esta bajo el puntero.
+enum class CropHandle {
+    None,
+    Move,
+    TopLeft, Top, TopRight,
+    Left, Right,
+    BottomLeft, Bottom, BottomRight,
+};
+
+// Controles del panel de ajustes.
+enum class FilterControl {
+    None,
+    Exposure, Brightness, Contrast, Saturation, Gamma,
+    Shadows, Midtones, Highlights,
+    Reset,
+};
+
+struct FilterRange {
+    float minimum;
+    float maximum;
+};
+
+// Rango de cada control. Vive aqui, y no repartido entre el dibujo y la
+// entrada, porque si los dos no coinciden el tirador se queda donde no debe.
+[[nodiscard]] constexpr FilterRange FilterRangeFor(FilterControl control) noexcept {
+    switch (control) {
+        case FilterControl::Exposure:   return {-3.0f, 3.0f};    // pasos de diafragma
+        case FilterControl::Brightness: return {-0.5f, 0.5f};
+        case FilterControl::Contrast:   return {0.0f, 2.0f};
+        case FilterControl::Saturation: return {0.0f, 2.0f};
+        case FilterControl::Gamma:      return {0.4f, 2.5f};
+        case FilterControl::Shadows:
+        case FilterControl::Midtones:
+        case FilterControl::Highlights: return {0.0f, 2.0f};
+        default:                        return {0.0f, 1.0f};
+    }
+}
+
+[[nodiscard]] constexpr float FilterValueOf(const ImageAdjustments& adjustments,
+                                            FilterControl control) noexcept {
+    switch (control) {
+        case FilterControl::Exposure:   return adjustments.exposure;
+        case FilterControl::Brightness: return adjustments.brightness;
+        case FilterControl::Contrast:   return adjustments.contrast;
+        case FilterControl::Saturation: return adjustments.saturation;
+        case FilterControl::Gamma:      return adjustments.gamma;
+        case FilterControl::Shadows:    return adjustments.shadows;
+        case FilterControl::Midtones:   return adjustments.midtones;
+        case FilterControl::Highlights: return adjustments.highlights;
+        default:                        return 0.0f;
+    }
+}
+
+constexpr void SetFilterValue(ImageAdjustments& adjustments, FilterControl control,
+                              float value) noexcept {
+    switch (control) {
+        case FilterControl::Exposure:   adjustments.exposure   = value; break;
+        case FilterControl::Brightness: adjustments.brightness = value; break;
+        case FilterControl::Contrast:   adjustments.contrast   = value; break;
+        case FilterControl::Saturation: adjustments.saturation = value; break;
+        case FilterControl::Gamma:      adjustments.gamma      = value; break;
+        case FilterControl::Shadows:    adjustments.shadows    = value; break;
+        case FilterControl::Midtones:   adjustments.midtones   = value; break;
+        case FilterControl::Highlights: adjustments.highlights = value; break;
+        default: break;
+    }
+}
 
 // Estado que la interfaz muestra. Se compara completo para decidir si hay que
 // repintar, de ahi el operador de igualdad.
@@ -63,6 +148,18 @@ struct OverlayModel {
     Micros trimStart = kNoTimestamp;
     Micros trimEnd   = kNoTimestamp;
     bool   trimBusy  = false;   // exportacion en curso
+
+    // Encuadre. Mientras `cropEditing` esta activo el video se muestra COMPLETO
+    // y el rectangulo se dibuja encima con el exterior atenuado: recortar en
+    // vivo impediria ver lo que se esta dejando fuera, que es justo lo que hay
+    // que juzgar al encuadrar.
+    bool       cropEditing = false;
+    CropRect   crop{};
+    ScreenRect videoRect{};   // donde se esta dibujando el fotograma
+
+    // Panel de ajustes de imagen.
+    bool             filtersOpen = false;
+    ImageAdjustments adjustments{};
 
     // Menu de velocidades desplegado (clic derecho sobre el indicador).
     bool speedMenuOpen = false;
@@ -99,6 +196,19 @@ public:
     [[nodiscard]] bool HitTestSpeed(int x, int y) const noexcept;
     [[nodiscard]] bool HitTestSnapshot(int x, int y) const noexcept;
     [[nodiscard]] bool HitTestTrim(int x, int y) const noexcept;
+    [[nodiscard]] bool HitTestCropButton(int x, int y) const noexcept;
+    [[nodiscard]] bool HitTestFiltersButton(int x, int y) const noexcept;
+
+    // Encuadre: que tirador hay bajo el punto.
+    [[nodiscard]] CropHandle HitTestCrop(int x, int y) const noexcept;
+
+    // Panel de ajustes: que control y con que valor normalizado (0..1).
+    [[nodiscard]] FilterControl HitTestFilters(int x, int y) const noexcept;
+    [[nodiscard]] float FilterValueAt(FilterControl control, int x, int y) const noexcept;
+
+    // Rectangulo del recorte en pixeles de cliente, para que la interfaz sepa
+    // donde esta sin repetir la aritmetica.
+    [[nodiscard]] ScreenRect CropScreenRect() const noexcept;
 
     // Tiradores de los puntos A y B sobre la barra de progreso.
     [[nodiscard]] bool HitTestTrimStart(int x, int y) const noexcept;
@@ -122,7 +232,9 @@ private:
     void DrawControlBar(unsigned width, unsigned height);
     void DrawTransport(float left, float centerY);
     void DrawTrimRange(float barLeft, float barRight, float barY);
-    void DrawSpeedControl(float right, float centerY);
+    void DrawCropEditor();
+    void DrawFiltersPanel(float right, float bottom);
+    void DrawRightControls(float right, float centerY);
     void DrawSpeedMenu();
     void DrawWelcome(unsigned width, unsigned height);
     void DrawStats(unsigned width);
@@ -147,6 +259,8 @@ private:
     ComPtr<IDWriteTextFormat> welcomeBodyFormat_;
     ComPtr<IDWriteTextFormat> hintKeyFormat_;   // columna de teclas, a la derecha
     ComPtr<IDWriteTextFormat> hintTextFormat_;
+    ComPtr<IDWriteTextFormat> panelFormat_;      // etiquetas del panel
+    ComPtr<IDWriteTextFormat> panelValueFormat_; // valores, alineados a la derecha
 
     // El triangulo de reproduccion se reutiliza para el boton de play, los de
     // paso y el icono de la bienvenida. Crearlo una vez y moverlo con una
@@ -188,6 +302,14 @@ private:
     D2D1_RECT_F speedRect_{};
     D2D1_RECT_F snapshotRect_{};
     D2D1_RECT_F trimRect_{};
+    D2D1_RECT_F cropButtonRect_{};
+    D2D1_RECT_F filtersButtonRect_{};
+    D2D1_RECT_F filtersPanelRect_{};
+    D2D1_RECT_F toneGraphRect_{};
+
+    // Pista de cada deslizador del panel, en el orden de FilterControl.
+    std::array<D2D1_RECT_F, 5> sliderTracks_{};
+    D2D1_RECT_F resetRect_{};
     D2D1_RECT_F trimStartHandle_{};
     D2D1_RECT_F trimEndHandle_{};
     D2D1_RECT_F speedMenuRect_{};

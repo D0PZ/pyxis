@@ -454,16 +454,22 @@ void VideoRenderer::FillConstants(Constants& out, const VideoFrame& frame,
                                   bool hdrOutput) const {
     BuildColorMatrix(frame.color, out.yuvToRgb);
 
-    // Porcion util frente al tamano real de la textura del pool.
-    out.uvScale[0] = textureWidth > 0
-                         ? static_cast<float>(frame.width) / static_cast<float>(textureWidth)
-                         : 1.0f;
-    out.uvScale[1] = textureHeight > 0
-                         ? static_cast<float>(frame.height) / static_cast<float>(textureHeight)
-                         : 1.0f;
+    // Porcion util frente al tamano real de la textura del pool, combinada con
+    // el recorte de encuadre. Las dos son la misma operacion, asi que el
+    // recorte no cuesta nada en el shader.
+    const float visibleU = textureWidth > 0
+                               ? static_cast<float>(frame.width) /
+                                     static_cast<float>(textureWidth)
+                               : 1.0f;
+    const float visibleV = textureHeight > 0
+                               ? static_cast<float>(frame.height) /
+                                     static_cast<float>(textureHeight)
+                               : 1.0f;
 
-    out.texelSize[0] = textureWidth > 0 ? 1.0f / static_cast<float>(textureWidth) : 0.0f;
-    out.texelSize[1] = textureHeight > 0 ? 1.0f / static_cast<float>(textureHeight) : 0.0f;
+    out.uvScale[0]  = visibleU * crop_.Width();
+    out.uvScale[1]  = visibleV * crop_.Height();
+    out.uvOffset[0] = visibleU * crop_.left;
+    out.uvOffset[1] = visibleV * crop_.top;
 
     out.inputTransfer = TransferCode(frame.color.transfer);
     out.outputHdr     = hdrOutput ? 1u : 0u;
@@ -479,8 +485,28 @@ void VideoRenderer::FillConstants(Constants& out, const VideoFrame& frame,
     out.srcPeakNits = peak;
 
     out.brightness = adjustments_.brightness;
+    out.exposure   = adjustments_.exposure;
     out.contrast   = adjustments_.contrast;
     out.saturation = adjustments_.saturation;
+    out.gamma      = adjustments_.gamma;
+    out.shadows    = adjustments_.shadows;
+    out.midtones   = adjustments_.midtones;
+    out.highlights = adjustments_.highlights;
+}
+
+// El recorte cambia las proporciones: un 16:9 recortado a la mitad derecha es
+// 8:9, y el encuadre debe respetarlo o la imagen saldria estirada.
+RECT VideoRenderer::ComputeCroppedFitRect(unsigned targetWidth, unsigned targetHeight,
+                                          int videoWidth, int videoHeight,
+                                          AVRational sampleAspect,
+                                          const CropRect& crop) noexcept {
+    const int croppedWidth =
+        std::max(1, static_cast<int>(std::lround(videoWidth * crop.Width())));
+    const int croppedHeight =
+        std::max(1, static_cast<int>(std::lround(videoHeight * crop.Height())));
+
+    return ComputeFitRect(targetWidth, targetHeight, croppedWidth, croppedHeight,
+                          sampleAspect);
 }
 
 // ---------------------------------------------------------------------------
@@ -586,8 +612,9 @@ void VideoRenderer::Draw(SwapChain& swapChain, const VideoFrame& frame,
 
     // Viewport = rectangulo util. Al ampliar puede desbordar la ventana; el
     // rasterizador recorta y el shader solo corre sobre lo visible.
-    const RECT fitRect = ComputeFitRect(swapChain.Width(), swapChain.Height(),
-                                        frame.width, frame.height, sampleAspect);
+    const RECT fitRect = ComputeCroppedFitRect(swapChain.Width(), swapChain.Height(),
+                                               frame.width, frame.height, sampleAspect,
+                                               crop_);
     const RECT destination = ApplyView(fitRect, swapChain.Width(), swapChain.Height(), view_);
     lastVideoRect_ = destination;
 
@@ -609,12 +636,15 @@ ComPtr<ID3D11Texture2D> VideoRenderer::RenderToTexture(const VideoFrame& frame,
 
     // Tamano de PRESENTACION: en material anamorfico la anchura almacenada no
     // es la que hay que guardar, o la captura saldria achatada.
-    unsigned width = static_cast<unsigned>(frame.width);
+    // La captura respeta el recorte: lo que se guarda es lo que se ve.
+    unsigned width = static_cast<unsigned>(
+        std::max(1L, std::lround(frame.width * crop_.Width())));
     if (sampleAspect.num > 0 && sampleAspect.den > 0 && sampleAspect.num != sampleAspect.den) {
         width = static_cast<unsigned>(std::lround(
-            static_cast<double>(frame.width) * sampleAspect.num / sampleAspect.den));
+            static_cast<double>(width) * sampleAspect.num / sampleAspect.den));
     }
-    const auto height = static_cast<unsigned>(frame.height);
+    const auto height = static_cast<unsigned>(
+        std::max(1L, std::lround(frame.height * crop_.Height())));
 
     D3D11_TEXTURE2D_DESC description{};
     description.Width      = width;
