@@ -281,7 +281,7 @@ winget install Kitware.CMake Ninja-build.Ninja
 <summary>Pruebas</summary>
 
 ```powershell
-.	estsun-tests.ps1
+.\tests\run-tests.ps1
 ```
 
 Once casos funcionales que abren la ventana, le mandan teclas y clics y

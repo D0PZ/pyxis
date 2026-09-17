@@ -453,12 +453,9 @@ primera herramienta a mirar** ante cualquier problema de fluidez:
 ## Pruebas
 
 ```powershell
-.	ests
-un-tests.ps1                              # toda la suite
-.	ests
-un-tests.ps1 -Case audio                  # uno
-.	ests
-un-tests.ps1 -Sample 'D:lgo 8K.mkv'     # con material grande
+.\tests\run-tests.ps1                              # toda la suite
+.\tests\run-tests.ps1 -Case audio                  # uno
+.\tests\run-tests.ps1 -Sample 'D:\algo 8K.mkv'     # con material grande
 ```
 
 Son pruebas funcionales: abren la ventana, mandan teclas y clics con
